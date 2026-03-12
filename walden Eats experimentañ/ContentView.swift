@@ -18,20 +18,33 @@ struct UserProfile: Identifiable, Codable, Equatable {
     var age: Int
     var grade: String
     var email: String = ""
-    var accountCode: String = ""
-    var accountFunds: Int = 0
+
+    // Tarjeta estudiantil
+    var studentCardNumber: String = ""
+    var identifierCode: String = ""
+    var accountFunds: Double = 1000.0
 
     enum CodingKeys: String, CodingKey {
-        case id, name, age, grade, email, accountCode, accountFunds
+        case id, name, age, grade, email, studentCardNumber, identifierCode, accountFunds
     }
 
-    init(id: UUID = UUID(), name: String, age: Int, grade: String, email: String = "", accountCode: String = "", accountFunds: Int = 0) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        age: Int,
+        grade: String,
+        email: String = "",
+        studentCardNumber: String = "",
+        identifierCode: String = "",
+        accountFunds: Double = 1000.0
+    ) {
         self.id = id
         self.name = name
         self.age = age
         self.grade = grade
         self.email = email
-        self.accountCode = accountCode
+        self.studentCardNumber = studentCardNumber
+        self.identifierCode = identifierCode
         self.accountFunds = accountFunds
     }
 
@@ -42,16 +55,10 @@ struct UserProfile: Identifiable, Codable, Equatable {
         age = try container.decodeIfPresent(Int.self, forKey: .age) ?? 15
         grade = try container.decodeIfPresent(String.self, forKey: .grade) ?? ""
         email = try container.decodeIfPresent(String.self, forKey: .email) ?? ""
-        accountCode = try container.decodeIfPresent(String.self, forKey: .accountCode) ?? ""
-        accountFunds = try container.decodeIfPresent(Int.self, forKey: .accountFunds) ?? 0
+        studentCardNumber = try container.decodeIfPresent(String.self, forKey: .studentCardNumber) ?? ""
+        identifierCode = try container.decodeIfPresent(String.self, forKey: .identifierCode) ?? ""
+        accountFunds = try container.decodeIfPresent(Double.self, forKey: .accountFunds) ?? 1000.0
     }
-}
-
-struct CreditCard: Identifiable, Codable, Equatable {
-    var id = UUID()
-    var holderName: String
-    var lastFour: String
-    var expiry: String
 }
 
 struct FoodItem: Identifiable, Hashable {
@@ -96,12 +103,9 @@ func cerrarSesionLocal() {
 }
 
 // MARK: - GUARDADO LOCAL
-func guardarEnTelefono(users: [UserProfile], cards: [CreditCard], history: [PastOrder]) {
+func guardarEnTelefono(users: [UserProfile], history: [PastOrder]) {
     if let encoded = try? JSONEncoder().encode(users) {
         UserDefaults.standard.set(encoded, forKey: "WaldenData")
-    }
-    if let encoded = try? JSONEncoder().encode(cards) {
-        UserDefaults.standard.set(encoded, forKey: "WaldenCards")
     }
     if let encoded = try? JSONEncoder().encode(history) {
         UserDefaults.standard.set(encoded, forKey: "WaldenHistory")
@@ -114,39 +118,38 @@ func agruparItems(_ items: [FoodItem]) -> String {
     return contados.sorted().joined(separator: ", ")
 }
 
-func generarCodigoCuenta() -> String {
-    String(Int.random(in: 10000000...99999999))
+func generarNumeroTarjetaEstudiantil() -> String {
+    (0..<10).map { _ in String(Int.random(in: 0...9)) }.joined()
 }
 
-func generarFondosAleatorios() -> Int {
-    Int.random(in: 50...2500)
+func generarCodigoIdentificador() -> String {
+    "MAS\(Int.random(in: 1000...9999))"
+}
+
+func formatearNumeroTarjeta(_ number: String) -> String {
+    stride(from: 0, to: number.count, by: 5).map { index in
+        let start = number.index(number.startIndex, offsetBy: index)
+        let end = number.index(start, offsetBy: min(5, number.count - index), limitedBy: number.endIndex) ?? number.endIndex
+        return String(number[start..<end])
+    }.joined(separator: " ")
 }
 
 // MARK: - PUNTO DE ENTRADA
 @main
 struct WaldenEatsApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @StateObject var store = UserStore()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(store)
         }
     }
-}
-
-class UserStore: ObservableObject {
-    @Published var users: [UserProfile] = []
-    @Published var cards: [CreditCard] = []
-    @Published var history: [PastOrder] = []
 }
 
 // MARK: - VISTA PRINCIPAL
 struct ContentView: View {
     @State private var showSplash = true
     @State private var users: [UserProfile] = []
-    @State private var cards: [CreditCard] = []
     @State private var history: [PastOrder] = []
     @State private var cart: [FoodItem] = []
     @State private var loggedEmail: String? = nil
@@ -160,16 +163,16 @@ struct ContentView: View {
                 LoginView(loggedEmail: $loggedEmail)
             } else {
                 TabView {
-                    MenuView(cart: $cart, users: $users, cards: $cards, history: $history)
+                    MenuView(cart: $cart, users: $users, history: $history)
                         .tabItem { Label("Menú", systemImage: "fork.knife") }
 
-                    HistoryView(history: $history, users: $users, cards: $cards)
+                    HistoryView(history: $history, users: $users)
                         .tabItem { Label("Pedidos", systemImage: "clock.fill") }
 
-                    SettingsView(users: $users, cards: $cards, history: $history, loggedEmail: $loggedEmail)
+                    SettingsView(users: $users, history: $history, loggedEmail: $loggedEmail)
                         .tabItem { Label("Ajustes", systemImage: "gearshape.fill") }
 
-                    AccountView(users: $users, cards: $cards, history: $history, loggedEmail: $loggedEmail)
+                    AccountView(users: $users, history: $history, loggedEmail: $loggedEmail)
                         .tabItem { Label("Cuenta", systemImage: "person.crop.circle.fill") }
                 }
             }
@@ -178,11 +181,6 @@ struct ContentView: View {
             if let data = UserDefaults.standard.data(forKey: "WaldenData"),
                let decoded = try? JSONDecoder().decode([UserProfile].self, from: data) {
                 users = decoded
-            }
-
-            if let data = UserDefaults.standard.data(forKey: "WaldenCards"),
-               let decoded = try? JSONDecoder().decode([CreditCard].self, from: data) {
-                cards = decoded
             }
 
             if let data = UserDefaults.standard.data(forKey: "WaldenHistory"),
@@ -370,7 +368,6 @@ struct LoginView: View {
 struct MenuView: View {
     @Binding var cart: [FoodItem]
     @Binding var users: [UserProfile]
-    @Binding var cards: [CreditCard]
     @Binding var history: [PastOrder]
 
     @State private var expandedCategories: Set<String> = [
@@ -576,7 +573,7 @@ struct MenuView: View {
                 }
 
                 if !cart.isEmpty {
-                    NavigationLink(destination: CheckoutView(cart: $cart, users: $users, cards: $cards, history: $history)) {
+                    NavigationLink(destination: CheckoutView(cart: $cart, users: $users, history: $history)) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Ir a pagar")
@@ -683,18 +680,21 @@ struct MenuView: View {
 struct CheckoutView: View {
     @Binding var cart: [FoodItem]
     @Binding var users: [UserProfile]
-    @Binding var cards: [CreditCard]
     @Binding var history: [PastOrder]
 
     @State private var selUser = 0
-    @State private var selCard = 0
     @State private var selectedRecess = "1er Receso"
     @State private var showSuccess = false
+    @State private var paymentError = ""
+
+    var totalOrder: Double {
+        cart.reduce(0) { $0 + $1.price }
+    }
 
     var body: some View {
         Form {
-            if users.isEmpty || cards.isEmpty {
-                Text("⚠️ Registra tu perfil y tarjeta en Ajustes")
+            if users.isEmpty {
+                Text("⚠️ Registra un estudiante en Ajustes")
                     .foregroundColor(.red)
                     .padding()
             } else {
@@ -702,17 +702,34 @@ struct CheckoutView: View {
                     Text(agruparItems(cart))
                         .font(.subheadline)
 
-                    Text("Total: $\(cart.reduce(0) { $0 + $1.price }, specifier: "%.2f")")
+                    Text("Total: $\(totalOrder, specifier: "%.2f")")
                         .font(.headline)
                         .foregroundColor(.accentColor)
                 }
 
-                Section("Usuario") {
+                Section("Estudiante") {
                     Picker("¿Quién eres?", selection: $selUser) {
                         ForEach(0..<users.count, id: \.self) {
                             Text(users[$0].name).tag($0)
                         }
                     }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Tarjeta estudiantil")
+                            .font(.headline)
+
+                        Text("Número: \(formatearNumeroTarjeta(users[selUser].studentCardNumber))")
+                            .font(.subheadline)
+
+                        Text("Código identificador: \(users[selUser].identifierCode)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Text("Fondos disponibles: $\(users[selUser].accountFunds, specifier: "%.2f")")
+                            .font(.headline)
+                            .foregroundColor(.green)
+                    }
+                    .padding(.vertical, 6)
                 }
 
                 Section("Entrega") {
@@ -724,52 +741,67 @@ struct CheckoutView: View {
                 }
 
                 Section("Pago") {
-                    Picker("Tarjeta", selection: $selCard) {
-                        ForEach(0..<cards.count, id: \.self) {
-                            Text("**** \(cards[$0].lastFour)").tag($0)
-                        }
-                    }
-                }
+                    Text("Pago con fondos de tarjeta estudiantil")
+                        .foregroundColor(.secondary)
 
-                Button("Confirmar Pedido") {
-                    let id = "\(String("ABCDEFGHIJKLMNOPQRSTUVWXYZ".randomElement()!))\(Int.random(in: 1...99))"
-                    let orderString = agruparItems(cart)
-                    let totalOrder = cart.reduce(0) { $0 + $1.price }
-
-                    let order = PastOrder(
-                        orderID: id,
-                        date: Date(),
-                        userName: users[selUser].name,
-                        items: orderString,
-                        total: totalOrder,
-                        recess: selectedRecess
-                    )
-
-                    history.insert(order, at: 0)
-                    guardarEnTelefono(users: users, cards: cards, history: history)
-
-                    let db = Firestore.firestore()
-                    db.collection("pedidos").document(id).setData([
-                        "orderID": id,
-                        "userName": users[selUser].name,
-                        "items": orderString,
-                        "total": totalOrder,
-                        "recess": selectedRecess,
-                        "timestamp": FieldValue.serverTimestamp(),
-                        "status": "pendiente"
-                    ]) { error in
-                        if let error = error {
-                            print("Error al guardar en Firebase: \(error.localizedDescription)")
-                        } else {
-                            print("¡Pedido \(id) enviado a Firebase con éxito!")
-                        }
+                    if !paymentError.isEmpty {
+                        Text(paymentError)
+                            .foregroundColor(.red)
+                            .font(.caption)
                     }
 
-                    showSuccess = true
+                    Button("Confirmar Pedido") {
+                        guard users.indices.contains(selUser) else { return }
+
+                        if users[selUser].accountFunds < totalOrder {
+                            paymentError = "Fondos insuficientes en la tarjeta estudiantil."
+                            return
+                        }
+
+                        paymentError = ""
+
+                        let id = "\(String("ABCDEFGHIJKLMNOPQRSTUVWXYZ".randomElement()!))\(Int.random(in: 1...99))"
+                        let orderString = agruparItems(cart)
+
+                        users[selUser].accountFunds -= totalOrder
+
+                        let order = PastOrder(
+                            orderID: id,
+                            date: Date(),
+                            userName: users[selUser].name,
+                            items: orderString,
+                            total: totalOrder,
+                            recess: selectedRecess
+                        )
+
+                        history.insert(order, at: 0)
+                        guardarEnTelefono(users: users, history: history)
+
+                        let db = Firestore.firestore()
+                        db.collection("pedidos").document(id).setData([
+                            "orderID": id,
+                            "userName": users[selUser].name,
+                            "items": orderString,
+                            "total": totalOrder,
+                            "recess": selectedRecess,
+                            "timestamp": FieldValue.serverTimestamp(),
+                            "status": "pendiente",
+                            "studentCardNumber": users[selUser].studentCardNumber,
+                            "identifierCode": users[selUser].identifierCode
+                        ]) { error in
+                            if let error = error {
+                                print("Error al guardar en Firebase: \(error.localizedDescription)")
+                            } else {
+                                print("¡Pedido \(id) enviado a Firebase con éxito!")
+                            }
+                        }
+
+                        showSuccess = true
+                    }
+                    .bold()
+                    .frame(maxWidth: .infinity)
+                    .foregroundColor(.accentColor)
                 }
-                .bold()
-                .frame(maxWidth: .infinity)
-                .foregroundColor(.accentColor)
             }
         }
         .navigationTitle("Pago")
@@ -783,7 +815,7 @@ struct CheckoutView: View {
                     .font(.largeTitle)
                     .bold()
 
-                Text("Tu pedido se ha enviado a la cafetería")
+                Text("Tu pedido se pagó con la tarjeta estudiantil")
                     .foregroundColor(.secondary)
 
                 Button("Volver") {
@@ -803,7 +835,6 @@ struct CheckoutView: View {
 struct HistoryView: View {
     @Binding var history: [PastOrder]
     @Binding var users: [UserProfile]
-    @Binding var cards: [CreditCard]
 
     var body: some View {
         NavigationStack {
@@ -862,13 +893,13 @@ struct HistoryView: View {
                         }
                         .onDelete { offsets in
                             history.remove(atOffsets: offsets)
-                            guardarEnTelefono(users: users, cards: cards, history: history)
+                            guardarEnTelefono(users: users, history: history)
                         }
 
                         if !history.isEmpty {
                             Button("Borrar todo el historial") {
                                 history.removeAll()
-                                guardarEnTelefono(users: users, cards: cards, history: history)
+                                guardarEnTelefono(users: users, history: history)
                             }
                             .foregroundColor(.red)
                             .frame(maxWidth: .infinity)
@@ -932,19 +963,12 @@ struct ClaimView: View {
 // MARK: - AJUSTES
 struct SettingsView: View {
     @Binding var users: [UserProfile]
-    @Binding var cards: [CreditCard]
     @Binding var history: [PastOrder]
     @Binding var loggedEmail: String?
 
     @State private var nName = ""
     @State private var nGrade = ""
     @State private var nEmail = ""
-
-    @State private var cName = ""
-    @State private var cNum = ""
-    @State private var cExp = ""
-    @State private var cCvv = ""
-
     @State private var emailError = ""
 
     var body: some View {
@@ -967,14 +991,14 @@ struct SettingsView: View {
 
                 Section("Usuarios / Estudiantes") {
                     ForEach(users) { user in
-                        VStack(alignment: .leading, spacing: 6) {
+                        VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("\(user.name) (\(user.grade))")
                                     .font(.headline)
                                 Spacer()
                                 Button(action: {
                                     users.removeAll(where: { $0.id == user.id })
-                                    guardarEnTelefono(users: users, cards: cards, history: history)
+                                    guardarEnTelefono(users: users, history: history)
                                 }) {
                                     Image(systemName: "trash")
                                         .foregroundColor(.red)
@@ -988,13 +1012,15 @@ struct SettingsView: View {
                                     .foregroundColor(.secondary)
                             }
 
-                            if !user.accountCode.isEmpty {
-                                Text("Cuenta: \(user.accountCode)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
+                            Text("Tarjeta: \(formatearNumeroTarjeta(user.studentCardNumber))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
 
-                            Text("Fondos: $\(user.accountFunds)")
+                            Text("Código identificador: \(user.identifierCode)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            Text("Fondos: $\(user.accountFunds, specifier: "%.2f")")
                                 .font(.caption.bold())
                                 .foregroundColor(.accentColor)
                         }
@@ -1032,63 +1058,18 @@ struct SettingsView: View {
                                     age: 15,
                                     grade: nGrade,
                                     email: cleanEmail,
-                                    accountCode: generarCodigoCuenta(),
-                                    accountFunds: generarFondosAleatorios()
+                                    studentCardNumber: generarNumeroTarjetaEstudiantil(),
+                                    identifierCode: generarCodigoIdentificador(),
+                                    accountFunds: 1000.0
                                 )
                             )
 
-                            guardarEnTelefono(users: users, cards: cards, history: history)
+                            guardarEnTelefono(users: users, history: history)
                             nName = ""
                             nGrade = ""
                             nEmail = ""
                         }
                         .disabled(nName.isEmpty || nGrade.isEmpty || nEmail.isEmpty)
-                    }
-                }
-
-                Section("Tarjetas") {
-                    ForEach(cards) { card in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("**** \(card.lastFour)")
-                                Text(card.holderName)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-
-                            Spacer()
-
-                            Button(action: {
-                                cards.removeAll(where: { $0.id == card.id })
-                                guardarEnTelefono(users: users, cards: cards, history: history)
-                            }) {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(BorderlessButtonStyle())
-                        }
-                    }
-
-                    DisclosureGroup("Añadir Tarjeta") {
-                        TextField("Titular", text: $cName)
-                        TextField("Número", text: $cNum)
-                            .keyboardType(.numberPad)
-
-                        HStack {
-                            TextField("MM/AA", text: $cExp)
-                            TextField("CVV", text: $cCvv)
-                                .keyboardType(.numberPad)
-                        }
-
-                        Button("Guardar") {
-                            cards.append(CreditCard(holderName: cName, lastFour: String(cNum.suffix(4)), expiry: cExp))
-                            guardarEnTelefono(users: users, cards: cards, history: history)
-                            cName = ""
-                            cNum = ""
-                            cExp = ""
-                            cCvv = ""
-                        }
-                        .disabled(cNum.count < 15)
                     }
                 }
             }
@@ -1100,7 +1081,6 @@ struct SettingsView: View {
 // MARK: - CUENTA
 struct AccountView: View {
     @Binding var users: [UserProfile]
-    @Binding var cards: [CreditCard]
     @Binding var history: [PastOrder]
     @Binding var loggedEmail: String?
 
@@ -1134,7 +1114,7 @@ struct AccountView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 22))
 
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("Fondos de la cuenta")
+                        Text("Tarjetas estudiantiles")
                             .font(.title3.bold())
 
                         if users.isEmpty {
@@ -1142,51 +1122,85 @@ struct AccountView: View {
                                 .foregroundColor(.secondary)
                         } else {
                             ForEach(users.indices, id: \.self) { index in
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(users[index].name)
-                                                .font(.headline)
+                                VStack(spacing: 14) {
+                                    VStack(alignment: .leading, spacing: 14) {
+                                        HStack {
+                                            VStack(alignment: .leading, spacing: 6) {
+                                                Text("Tarjeta estudiantil")
+                                                    .font(.caption.bold())
+                                                    .foregroundColor(.white.opacity(0.85))
 
-                                            Text(users[index].grade)
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
+                                                Text(users[index].name)
+                                                    .font(.title3.bold())
+                                                    .foregroundColor(.white)
+                                            }
+
+                                            Spacer()
+
+                                            Image(systemName: "creditcard.fill")
+                                                .font(.title2)
+                                                .foregroundColor(.white.opacity(0.9))
                                         }
 
-                                        Spacer()
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            Text(formatearNumeroTarjeta(users[index].studentCardNumber))
+                                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.white)
 
-                                        Text("$\(users[index].accountFunds)")
-                                            .font(.headline.bold())
-                                            .foregroundColor(.accentColor)
-                                    }
+                                            Text("Código identificador: \(users[index].identifierCode)")
+                                                .font(.subheadline)
+                                                .foregroundColor(.white.opacity(0.92))
 
-                                    if !users[index].email.isEmpty {
-                                        Text(users[index].email)
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-
-                                    if !users[index].accountCode.isEmpty {
-                                        Text("Cuenta: \(users[index].accountCode)")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-
-                                    Button("Fondos de la cuenta") {
-                                        users[index].accountFunds = generarFondosAleatorios()
-
-                                        if users[index].accountCode.isEmpty {
-                                            users[index].accountCode = generarCodigoCuenta()
+                                            Text("Saldo disponible: $\(users[index].accountFunds, specifier: "%.2f")")
+                                                .font(.headline.bold())
+                                                .foregroundColor(.white)
                                         }
-
-                                        guardarEnTelefono(users: users, cards: cards, history: history)
                                     }
-                                    .font(.subheadline.bold())
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
-                                    .background(Color.accentColor)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    .padding()
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(
+                                        LinearGradient(
+                                            colors: [Color.accentColor, Color.blue.opacity(0.75)],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 24))
+
+                                    VStack(spacing: 10) {
+                                        Button("Recargar $100") {
+                                            users[index].accountFunds += 100
+                                            guardarEnTelefono(users: users, history: history)
+                                        }
+                                        .font(.subheadline.bold())
+                                        .foregroundColor(.white)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(Color.green)
+                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                                        Button("Recargar $500") {
+                                            users[index].accountFunds += 500
+                                            guardarEnTelefono(users: users, history: history)
+                                        }
+                                        .font(.subheadline.bold())
+                                        .foregroundColor(.white)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(Color.accentColor)
+                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                                        Button("Generar nueva tarjeta") {
+                                            users[index].studentCardNumber = generarNumeroTarjetaEstudiantil()
+                                            users[index].identifierCode = generarCodigoIdentificador()
+                                            guardarEnTelefono(users: users, history: history)
+                                        }
+                                        .font(.subheadline.bold())
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(Color(UIColor.secondarySystemBackground))
+                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    }
                                 }
                                 .padding()
                                 .background(Color(UIColor.systemBackground))
