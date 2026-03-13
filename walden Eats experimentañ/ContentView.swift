@@ -4,25 +4,30 @@ import FirebaseCore
 import FirebaseFirestore
 
 // MARK: - CONFIGURACIÓN DE FIREBASE
-class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
         FirebaseApp.configure()
         return true
     }
 }
 
-// MARK: - MODELOS DE DATOS
+// MARK: - MODELOS
 struct UserProfile: Identifiable, Codable, Equatable {
-    var id = UUID()
+    var id: UUID = UUID()
     var name: String
     var age: Int
     var grade: String
     var email: String = ""
 
-    // Tarjeta estudiantil
+    // Tarjeta manual
     var studentCardNumber: String = ""
     var identifierCode: String = ""
-    var accountFunds: Double = 1000.0
+
+    // Saldo leído desde servidor
+    var accountFunds: Double = 0.0
 
     enum CodingKeys: String, CodingKey {
         case id, name, age, grade, email, studentCardNumber, identifierCode, accountFunds
@@ -36,7 +41,7 @@ struct UserProfile: Identifiable, Codable, Equatable {
         email: String = "",
         studentCardNumber: String = "",
         identifierCode: String = "",
-        accountFunds: Double = 1000.0
+        accountFunds: Double = 0.0
     ) {
         self.id = id
         self.name = name
@@ -57,27 +62,37 @@ struct UserProfile: Identifiable, Codable, Equatable {
         email = try container.decodeIfPresent(String.self, forKey: .email) ?? ""
         studentCardNumber = try container.decodeIfPresent(String.self, forKey: .studentCardNumber) ?? ""
         identifierCode = try container.decodeIfPresent(String.self, forKey: .identifierCode) ?? ""
-        accountFunds = try container.decodeIfPresent(Double.self, forKey: .accountFunds) ?? 1000.0
+        accountFunds = try container.decodeIfPresent(Double.self, forKey: .accountFunds) ?? 0.0
     }
 }
 
-struct FoodItem: Identifiable, Hashable {
-    let id = UUID()
+struct FoodItem: Identifiable, Hashable, Codable {
+    let id: UUID
     let name: String
     let price: Double
     let category: String
     let icon: String
-    var dayOfWeek: Int? = nil
+    var dayOfWeek: Int?
+
+    init(id: UUID = UUID(), name: String, price: Double, category: String, icon: String, dayOfWeek: Int? = nil) {
+        self.id = id
+        self.name = name
+        self.price = price
+        self.category = category
+        self.icon = icon
+        self.dayOfWeek = dayOfWeek
+    }
 }
 
 struct PastOrder: Identifiable, Codable, Equatable {
-    var id = UUID()
+    var id: UUID = UUID()
     var orderID: String?
     let date: Date
     let userName: String
     let items: String
     let total: Double
     let recess: String
+    let status: String
 }
 
 // MARK: - SESIÓN
@@ -104,91 +119,255 @@ func cerrarSesionLocal() {
 
 // MARK: - GUARDADO LOCAL
 func guardarEnTelefono(users: [UserProfile], history: [PastOrder]) {
-    if let encoded = try? JSONEncoder().encode(users) {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+
+    if let encoded = try? encoder.encode(users) {
         UserDefaults.standard.set(encoded, forKey: "WaldenData")
     }
-    if let encoded = try? JSONEncoder().encode(history) {
+
+    if let encoded = try? encoder.encode(history) {
         UserDefaults.standard.set(encoded, forKey: "WaldenHistory")
     }
 }
 
+func cargarUsuariosLocal() -> [UserProfile] {
+    guard let data = UserDefaults.standard.data(forKey: "WaldenData") else { return [] }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return (try? decoder.decode([UserProfile].self, from: data)) ?? []
+}
+
+func cargarHistorialLocal() -> [PastOrder] {
+    guard let data = UserDefaults.standard.data(forKey: "WaldenHistory") else { return [] }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return (try? decoder.decode([PastOrder].self, from: data)) ?? []
+}
+
+// MARK: - HELPERS
 func agruparItems(_ items: [FoodItem]) -> String {
     let dict = Dictionary(grouping: items, by: { $0.name })
     let contados = dict.map { "\($0.value.count)x \($0.key)" }
     return contados.sorted().joined(separator: ", ")
 }
 
-func generarNumeroTarjetaEstudiantil() -> String {
-    (0..<10).map { _ in String(Int.random(in: 0...9)) }.joined()
-}
-
-func generarCodigoIdentificador() -> String {
-    "MAS\(Int.random(in: 1000...9999))"
-}
-
 func formatearNumeroTarjeta(_ number: String) -> String {
-    stride(from: 0, to: number.count, by: 5).map { index in
-        let start = number.index(number.startIndex, offsetBy: index)
-        let end = number.index(start, offsetBy: min(5, number.count - index), limitedBy: number.endIndex) ?? number.endIndex
-        return String(number[start..<end])
+    let limpio = number.replacingOccurrences(of: " ", with: "")
+    return stride(from: 0, to: limpio.count, by: 4).map { index in
+        let start = limpio.index(limpio.startIndex, offsetBy: index)
+        let end = limpio.index(start, offsetBy: min(4, limpio.count - index), limitedBy: limpio.endIndex) ?? limpio.endIndex
+        return String(limpio[start..<end])
     }.joined(separator: " ")
+}
+
+func tarjetaEnmascarada(_ number: String) -> String {
+    let limpio = number.replacingOccurrences(of: " ", with: "")
+    guard limpio.count >= 4 else { return limpio }
+    let ultimos4 = String(limpio.suffix(4))
+    return "•••• •••• •••• \(ultimos4)"
+}
+
+func money(_ value: Double) -> String {
+    String(format: "$%.2f", value)
+}
+
+// MARK: - REPOSITORIO FIREBASE
+final class FirebaseWalletService: ObservableObject {
+    private let db = Firestore.firestore()
+    private var listeners: [ListenerRegistration] = []
+
+    deinit {
+        listeners.forEach { $0.remove() }
+    }
+
+    func stopListeners() {
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
+    }
+
+    func syncUsersBalances(appVM: AppViewModel) {
+        stopListeners()
+
+        for user in appVM.users {
+            guard !user.email.isEmpty else { continue }
+
+            let docID = normalizarCorreo(user.email)
+
+            let listener = db.collection("students").document(docID).addSnapshotListener { snapshot, _ in
+                guard let data = snapshot?.data() else { return }
+
+                let remoteFunds = data["accountFunds"] as? Double ?? data["accountFunds"] as? NSNumber as? Double ?? 0.0
+                let remoteCard = data["studentCardNumber"] as? String ?? user.studentCardNumber
+                let remoteCode = data["identifierCode"] as? String ?? user.identifierCode
+
+                DispatchQueue.main.async {
+                    if let index = appVM.users.firstIndex(where: { normalizarCorreo($0.email) == docID }) {
+                        appVM.users[index].accountFunds = remoteFunds
+                        appVM.users[index].studentCardNumber = remoteCard
+                        appVM.users[index].identifierCode = remoteCode
+                        guardarEnTelefono(users: appVM.users, history: appVM.history)
+                    }
+                }
+            }
+
+            listeners.append(listener)
+        }
+    }
+
+    func createOrUpdateStudent(_ user: UserProfile) {
+        guard !user.email.isEmpty else { return }
+
+        let docID = normalizarCorreo(user.email)
+
+        db.collection("students").document(docID).setData([
+            "name": user.name,
+            "age": user.age,
+            "grade": user.grade,
+            "email": docID,
+            "studentCardNumber": user.studentCardNumber,
+            "identifierCode": user.identifierCode,
+            "accountFunds": user.accountFunds,
+            "updatedAt": FieldValue.serverTimestamp()
+        ], merge: true)
+    }
+
+    func sendOrder(
+        user: UserProfile,
+        cart: [FoodItem],
+        recess: String,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        let orderID = "\(String("ABCDEFGHIJKLMNOPQRSTUVWXYZ".randomElement()!))\(Int.random(in: 10...99))"
+        let itemsText = agruparItems(cart)
+        let total = cart.reduce(0) { $0 + $1.price }
+
+        db.collection("pedidos").document(orderID).setData([
+            "orderID": orderID,
+            "userName": user.name,
+            "email": normalizarCorreo(user.email),
+            "items": itemsText,
+            "total": total,
+            "recess": recess,
+            "timestamp": FieldValue.serverTimestamp(),
+            "status": "pendiente",
+            "studentCardNumber": user.studentCardNumber,
+            "identifierCode": user.identifierCode
+        ]) { error in
+            if let error = error {
+                completion(.failure(error))
+            } else {
+                completion(.success(orderID))
+            }
+        }
+    }
+}
+
+// MARK: - VIEW MODEL
+final class AppViewModel: ObservableObject {
+    @Published var users: [UserProfile] = []
+    @Published var history: [PastOrder] = []
+    @Published var cart: [FoodItem] = []
+    @Published var loggedEmail: String? = nil
+
+    let firebase = FirebaseWalletService()
+
+    init() {
+        users = cargarUsuariosLocal()
+        history = cargarHistorialLocal()
+        loggedEmail = cargarSesion()
+    }
+
+    func persist() {
+        guardarEnTelefono(users: users, history: history)
+    }
+
+    func startServerSync() {
+        firebase.syncUsersBalances(appVM: self)
+    }
+
+    func stopServerSync() {
+        firebase.stopListeners()
+    }
+
+    func addStudent(name: String, grade: String, email: String, cardNumber: String, identifierCode: String) -> Bool {
+        let cleanEmail = normalizarCorreo(email)
+        let cleanCard = cardNumber.replacingOccurrences(of: " ", with: "")
+        let cleanCode = identifierCode.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard correoWaldenValido(cleanEmail) else { return false }
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !grade.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !cleanCard.isEmpty else { return false }
+        guard !cleanCode.isEmpty else { return false }
+
+        let newUser = UserProfile(
+            name: name,
+            age: 15,
+            grade: grade,
+            email: cleanEmail,
+            studentCardNumber: cleanCard,
+            identifierCode: cleanCode,
+            accountFunds: 0
+        )
+
+        users.append(newUser)
+        persist()
+        firebase.createOrUpdateStudent(newUser)
+        startServerSync()
+        return true
+    }
+
+    func removeStudent(_ user: UserProfile) {
+        users.removeAll { $0.id == user.id }
+        persist()
+        startServerSync()
+    }
 }
 
 // MARK: - PUNTO DE ENTRADA
 @main
 struct WaldenEatsApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @StateObject private var appVM = AppViewModel()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(appVM)
         }
     }
 }
 
 // MARK: - VISTA PRINCIPAL
 struct ContentView: View {
+    @EnvironmentObject var appVM: AppViewModel
     @State private var showSplash = true
-    @State private var users: [UserProfile] = []
-    @State private var history: [PastOrder] = []
-    @State private var cart: [FoodItem] = []
-    @State private var loggedEmail: String? = nil
 
     var body: some View {
         ZStack {
             if showSplash {
                 SplashScreenView(isActive: $showSplash)
-                    .transition(.opacity)
-            } else if loggedEmail == nil {
-                LoginView(loggedEmail: $loggedEmail)
+            } else if appVM.loggedEmail == nil {
+                LoginView()
             } else {
                 TabView {
-                    MenuView(cart: $cart, users: $users, history: $history)
+                    MenuView()
                         .tabItem { Label("Menú", systemImage: "fork.knife") }
 
-                    HistoryView(history: $history, users: $users)
+                    HistoryView()
                         .tabItem { Label("Pedidos", systemImage: "clock.fill") }
 
-                    SettingsView(users: $users, history: $history, loggedEmail: $loggedEmail)
+                    SettingsView()
                         .tabItem { Label("Ajustes", systemImage: "gearshape.fill") }
 
-                    AccountView(users: $users, history: $history, loggedEmail: $loggedEmail)
+                    AccountView()
                         .tabItem { Label("Cuenta", systemImage: "person.crop.circle.fill") }
                 }
+                .onAppear {
+                    appVM.startServerSync()
+                }
             }
-        }
-        .onAppear {
-            if let data = UserDefaults.standard.data(forKey: "WaldenData"),
-               let decoded = try? JSONDecoder().decode([UserProfile].self, from: data) {
-                users = decoded
-            }
-
-            if let data = UserDefaults.standard.data(forKey: "WaldenHistory"),
-               let decoded = try? JSONDecoder().decode([PastOrder].self, from: data) {
-                history = decoded
-            }
-
-            loggedEmail = cargarSesion()
         }
     }
 }
@@ -240,7 +419,7 @@ struct SplashScreenView: View {
                 textOpacity = 1.0
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.3) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                 withAnimation(.easeInOut(duration: 0.3)) {
                     isActive = false
                 }
@@ -251,7 +430,7 @@ struct SplashScreenView: View {
 
 // MARK: - LOGIN
 struct LoginView: View {
-    @Binding var loggedEmail: String?
+    @EnvironmentObject var appVM: AppViewModel
     @State private var email = ""
     @State private var password = ""
     @State private var errorText = ""
@@ -329,7 +508,8 @@ struct LoginView: View {
 
                                 errorText = ""
                                 guardarSesion(email: cleanEmail)
-                                loggedEmail = cleanEmail
+                                appVM.loggedEmail = cleanEmail
+                                appVM.startServerSync()
                             } label: {
                                 Text("Entrar")
                                     .font(.headline.bold())
@@ -345,16 +525,6 @@ struct LoginView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 28))
                         .shadow(color: .black.opacity(0.08), radius: 12, x: 0, y: 8)
 
-                        VStack(spacing: 6) {
-                            Text("Dominio permitido")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            Text("@waldendos.edu.mx")
-                                .font(.headline.bold())
-                                .foregroundColor(.accentColor)
-                        }
-
                         Spacer(minLength: 30)
                     }
                     .padding()
@@ -366,10 +536,7 @@ struct LoginView: View {
 
 // MARK: - MENÚ
 struct MenuView: View {
-    @Binding var cart: [FoodItem]
-    @Binding var users: [UserProfile]
-    @Binding var history: [PastOrder]
-
+    @EnvironmentObject var appVM: AppViewModel
     @State private var expandedCategories: Set<String> = [
         "⭐ Especialidad por Día",
         "🌮 Platos",
@@ -456,7 +623,7 @@ struct MenuView: View {
                                     if expandedCategories.contains(cat) {
                                         VStack(spacing: 12) {
                                             ForEach(menu.filter { $0.category == cat }) { item in
-                                                let quantity = cart.filter { $0.name == item.name }.count
+                                                let quantity = appVM.cart.filter { $0.name == item.name }.count
                                                 let isAvailable = (cat != "⭐ Especialidad por Día" || item.dayOfWeek == currentDay)
 
                                                 HStack(spacing: 14) {
@@ -476,7 +643,7 @@ struct MenuView: View {
                                                             .strikethrough(!isAvailable, color: .red)
 
                                                         HStack(spacing: 8) {
-                                                            Text("$\(item.price, specifier: "%.2f")")
+                                                            Text(money(item.price))
                                                                 .font(.subheadline)
                                                                 .foregroundColor(.secondary)
 
@@ -502,9 +669,9 @@ struct MenuView: View {
 
                                                     if isAvailable {
                                                         if quantity == 0 {
-                                                            Button(action: {
-                                                                cart.append(item)
-                                                            }) {
+                                                            Button {
+                                                                appVM.cart.append(item)
+                                                            } label: {
                                                                 Image(systemName: "plus.circle.fill")
                                                                     .font(.system(size: 34))
                                                                     .foregroundColor(.green)
@@ -512,11 +679,11 @@ struct MenuView: View {
                                                             .buttonStyle(.borderless)
                                                         } else {
                                                             HStack(spacing: 12) {
-                                                                Button(action: {
-                                                                    if let index = cart.lastIndex(where: { $0.name == item.name }) {
-                                                                        cart.remove(at: index)
+                                                                Button {
+                                                                    if let index = appVM.cart.lastIndex(where: { $0.name == item.name }) {
+                                                                        appVM.cart.remove(at: index)
                                                                     }
-                                                                }) {
+                                                                } label: {
                                                                     Image(systemName: quantity == 1 ? "trash.fill" : "minus.circle.fill")
                                                                         .font(.system(size: 24))
                                                                         .foregroundColor(quantity == 1 ? .red : .orange)
@@ -527,9 +694,9 @@ struct MenuView: View {
                                                                     .font(.headline.bold())
                                                                     .frame(minWidth: 20)
 
-                                                                Button(action: {
-                                                                    cart.append(item)
-                                                                }) {
+                                                                Button {
+                                                                    appVM.cart.append(item)
+                                                                } label: {
                                                                     Image(systemName: "plus.circle.fill")
                                                                         .font(.system(size: 28))
                                                                         .foregroundColor(.green)
@@ -544,7 +711,6 @@ struct MenuView: View {
                                                                 Capsule()
                                                                     .stroke(Color.gray.opacity(0.22), lineWidth: 1)
                                                             )
-                                                            .shadow(color: .black.opacity(0.06), radius: 4, x: 0, y: 2)
                                                         }
                                                     }
                                                 }
@@ -556,7 +722,6 @@ struct MenuView: View {
                                             }
                                         }
                                         .padding(.top, 12)
-                                        .transition(.opacity.combined(with: .move(edge: .top)))
                                     }
                                 }
                                 .padding()
@@ -566,27 +731,27 @@ struct MenuView: View {
                                 )
                             }
 
-                            Color.clear.frame(height: cart.isEmpty ? 12 : 100)
+                            Color.clear.frame(height: appVM.cart.isEmpty ? 12 : 100)
                         }
                         .padding()
                     }
                 }
 
-                if !cart.isEmpty {
-                    NavigationLink(destination: CheckoutView(cart: $cart, users: $users, history: $history)) {
+                if !appVM.cart.isEmpty {
+                    NavigationLink(destination: CheckoutView()) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Ir a pagar")
+                                Text("Enviar pedido")
                                     .font(.headline.bold())
 
-                                Text("\(cart.count) artículo(s)")
+                                Text("\(appVM.cart.count) artículo(s)")
                                     .font(.caption)
                                     .foregroundColor(.white.opacity(0.88))
                             }
 
                             Spacer()
 
-                            Text("$\(cart.reduce(0) { $0 + $1.price }, specifier: "%.2f")")
+                            Text(money(appVM.cart.reduce(0) { $0 + $1.price }))
                                 .font(.headline.bold())
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 8)
@@ -595,15 +760,8 @@ struct MenuView: View {
                         }
                         .foregroundColor(.white)
                         .padding()
-                        .background(
-                            LinearGradient(
-                                colors: [Color.accentColor, Color.accentColor.opacity(0.8)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
+                        .background(Color.accentColor)
                         .clipShape(RoundedRectangle(cornerRadius: 22))
-                        .shadow(color: Color.accentColor.opacity(0.26), radius: 10, x: 0, y: 6)
                         .padding()
                     }
                 }
@@ -621,7 +779,7 @@ struct MenuView: View {
                         .font(.system(size: 30, weight: .heavy, design: .rounded))
                         .foregroundColor(.white)
 
-                    Text("Comida rica y nutritiva para tu día 🌟")
+                    Text("Tarjeta manual y saldo desde servidor")
                         .font(.subheadline)
                         .foregroundColor(.white.opacity(0.92))
                 }
@@ -638,12 +796,6 @@ struct MenuView: View {
                         .foregroundStyle(.white, .white)
                 }
             }
-
-            HStack(spacing: 8) {
-                pill("Rápido")
-                pill("Seguro")
-                pill("Escolar")
-            }
         }
         .padding()
         .background(
@@ -657,16 +809,6 @@ struct MenuView: View {
         .padding()
     }
 
-    private func pill(_ text: String) -> some View {
-        Text(text)
-            .font(.caption.bold())
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Color.white.opacity(0.18))
-            .foregroundColor(.white)
-            .clipShape(Capsule())
-    }
-
     private func toggleCategory(_ category: String) {
         if expandedCategories.contains(category) {
             expandedCategories.remove(category)
@@ -678,56 +820,59 @@ struct MenuView: View {
 
 // MARK: - CHECKOUT
 struct CheckoutView: View {
-    @Binding var cart: [FoodItem]
-    @Binding var users: [UserProfile]
-    @Binding var history: [PastOrder]
+    @EnvironmentObject var appVM: AppViewModel
+    @Environment(\.dismiss) private var dismiss
 
-    @State private var selUser = 0
+    @State private var selectedUserIndex = 0
     @State private var selectedRecess = "1er Receso"
     @State private var showSuccess = false
     @State private var paymentError = ""
 
     var totalOrder: Double {
-        cart.reduce(0) { $0 + $1.price }
+        appVM.cart.reduce(0) { $0 + $1.price }
     }
 
     var body: some View {
         Form {
-            if users.isEmpty {
+            if appVM.users.isEmpty {
                 Text("⚠️ Registra un estudiante en Ajustes")
                     .foregroundColor(.red)
                     .padding()
             } else {
                 Section("Resumen") {
-                    Text(agruparItems(cart))
-                        .font(.subheadline)
-
-                    Text("Total: $\(totalOrder, specifier: "%.2f")")
+                    Text(agruparItems(appVM.cart))
+                    Text("Total: \(money(totalOrder))")
                         .font(.headline)
                         .foregroundColor(.accentColor)
                 }
 
                 Section("Estudiante") {
-                    Picker("¿Quién eres?", selection: $selUser) {
-                        ForEach(0..<users.count, id: \.self) {
-                            Text(users[$0].name).tag($0)
+                    Picker("¿Quién eres?", selection: $selectedUserIndex) {
+                        ForEach(0..<appVM.users.count, id: \.self) { i in
+                            Text(appVM.users[i].name).tag(i)
                         }
                     }
 
+                    let user = appVM.users[selectedUserIndex]
+
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Tarjeta estudiantil")
+                        Text("Tarjeta registrada manualmente")
                             .font(.headline)
 
-                        Text("Número: \(formatearNumeroTarjeta(users[selUser].studentCardNumber))")
+                        Text("Número: \(formatearNumeroTarjeta(user.studentCardNumber))")
                             .font(.subheadline)
 
-                        Text("Código identificador: \(users[selUser].identifierCode)")
+                        Text("Código identificador: \(user.identifierCode)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 
-                        Text("Fondos disponibles: $\(users[selUser].accountFunds, specifier: "%.2f")")
+                        Text("Saldo en servidor: \(money(user.accountFunds))")
                             .font(.headline)
                             .foregroundColor(.green)
+
+                        Text("El descuento real debe hacerlo el servidor o panel admin.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
                     }
                     .padding(.vertical, 6)
                 }
@@ -740,10 +885,7 @@ struct CheckoutView: View {
                     .pickerStyle(.segmented)
                 }
 
-                Section("Pago") {
-                    Text("Pago con fondos de tarjeta estudiantil")
-                        .foregroundColor(.secondary)
-
+                Section("Pedido") {
                     if !paymentError.isEmpty {
                         Text(paymentError)
                             .foregroundColor(.red)
@@ -751,52 +893,53 @@ struct CheckoutView: View {
                     }
 
                     Button("Confirmar Pedido") {
-                        guard users.indices.contains(selUser) else { return }
+                        guard appVM.users.indices.contains(selectedUserIndex) else { return }
 
-                        if users[selUser].accountFunds < totalOrder {
-                            paymentError = "Fondos insuficientes en la tarjeta estudiantil."
+                        let user = appVM.users[selectedUserIndex]
+
+                        guard !user.studentCardNumber.isEmpty else {
+                            paymentError = "El estudiante no tiene una tarjeta registrada."
+                            return
+                        }
+
+                        guard !user.identifierCode.isEmpty else {
+                            paymentError = "El estudiante no tiene código identificador."
+                            return
+                        }
+
+                        guard user.accountFunds >= totalOrder else {
+                            paymentError = "Saldo insuficiente según el servidor."
                             return
                         }
 
                         paymentError = ""
 
-                        let id = "\(String("ABCDEFGHIJKLMNOPQRSTUVWXYZ".randomElement()!))\(Int.random(in: 1...99))"
-                        let orderString = agruparItems(cart)
-
-                        users[selUser].accountFunds -= totalOrder
-
-                        let order = PastOrder(
-                            orderID: id,
-                            date: Date(),
-                            userName: users[selUser].name,
-                            items: orderString,
-                            total: totalOrder,
+                        appVM.firebase.sendOrder(
+                            user: user,
+                            cart: appVM.cart,
                             recess: selectedRecess
-                        )
+                        ) { result in
+                            DispatchQueue.main.async {
+                                switch result {
+                                case .success(let orderID):
+                                    let order = PastOrder(
+                                        orderID: orderID,
+                                        date: Date(),
+                                        userName: user.name,
+                                        items: agruparItems(appVM.cart),
+                                        total: totalOrder,
+                                        recess: selectedRecess,
+                                        status: "pendiente"
+                                    )
+                                    appVM.history.insert(order, at: 0)
+                                    appVM.persist()
+                                    showSuccess = true
 
-                        history.insert(order, at: 0)
-                        guardarEnTelefono(users: users, history: history)
-
-                        let db = Firestore.firestore()
-                        db.collection("pedidos").document(id).setData([
-                            "orderID": id,
-                            "userName": users[selUser].name,
-                            "items": orderString,
-                            "total": totalOrder,
-                            "recess": selectedRecess,
-                            "timestamp": FieldValue.serverTimestamp(),
-                            "status": "pendiente",
-                            "studentCardNumber": users[selUser].studentCardNumber,
-                            "identifierCode": users[selUser].identifierCode
-                        ]) { error in
-                            if let error = error {
-                                print("Error al guardar en Firebase: \(error.localizedDescription)")
-                            } else {
-                                print("¡Pedido \(id) enviado a Firebase con éxito!")
+                                case .failure(let error):
+                                    paymentError = error.localizedDescription
+                                }
                             }
                         }
-
-                        showSuccess = true
                     }
                     .bold()
                     .frame(maxWidth: .infinity)
@@ -807,39 +950,42 @@ struct CheckoutView: View {
         .navigationTitle("Pago")
         .fullScreenCover(isPresented: $showSuccess) {
             VStack(spacing: 20) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 80))
+                Image(systemName: "paperplane.circle.fill")
+                    .font(.system(size: 82))
                     .foregroundColor(.green)
 
-                Text("¡Listo!")
+                Text("Pedido enviado")
                     .font(.largeTitle)
                     .bold()
 
-                Text("Tu pedido se pagó con la tarjeta estudiantil")
+                Text("Se mandó al servidor como pendiente. El saldo debe ajustarse desde el panel o backend.")
                     .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
 
                 Button("Volver") {
-                    cart.removeAll()
+                    appVM.cart.removeAll()
                     showSuccess = false
+                    dismiss()
                 }
                 .padding()
                 .background(Color.accentColor)
                 .foregroundColor(.white)
                 .cornerRadius(10)
             }
+            .padding()
         }
     }
 }
 
 // MARK: - HISTORIAL
 struct HistoryView: View {
-    @Binding var history: [PastOrder]
-    @Binding var users: [UserProfile]
+    @EnvironmentObject var appVM: AppViewModel
 
     var body: some View {
         NavigationStack {
             Group {
-                if history.isEmpty {
+                if appVM.history.isEmpty {
                     VStack(spacing: 16) {
                         Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 52))
@@ -848,13 +994,13 @@ struct HistoryView: View {
                         Text("Aún no hay pedidos")
                             .font(.title2.bold())
 
-                        Text("Cuando hagas tu primer pedido aparecerá aquí.")
+                        Text("Cuando mandes tu primer pedido aparecerá aquí.")
                             .foregroundColor(.secondary)
                     }
                     .padding()
                 } else {
                     List {
-                        ForEach(history) { order in
+                        ForEach(appVM.history) { order in
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
                                     Text(order.userName).bold()
@@ -867,7 +1013,6 @@ struct HistoryView: View {
 
                                 Text(order.items)
                                     .font(.subheadline)
-                                    .foregroundColor(.primary)
 
                                 HStack {
                                     Text(order.recess)
@@ -876,34 +1021,23 @@ struct HistoryView: View {
                                         .background(Color.accentColor.opacity(0.12))
                                         .cornerRadius(8)
 
+                                    Text(order.status.capitalized)
+                                        .font(.caption.bold())
+                                        .padding(6)
+                                        .background(Color.orange.opacity(0.12))
+                                        .cornerRadius(8)
+
                                     Spacer()
 
-                                    Text("$\(order.total, specifier: "%.2f")")
+                                    Text(money(order.total))
                                         .bold()
                                 }
-
-                                NavigationLink(destination: ClaimView(order: order)) {
-                                    Text("¿Problemas con el pedido?")
-                                        .font(.caption)
-                                        .foregroundColor(.red)
-                                }
-                                .padding(.top, 4)
                             }
                             .padding(.vertical, 6)
                         }
                         .onDelete { offsets in
-                            history.remove(atOffsets: offsets)
-                            guardarEnTelefono(users: users, history: history)
-                        }
-
-                        if !history.isEmpty {
-                            Button("Borrar todo el historial") {
-                                history.removeAll()
-                                guardarEnTelefono(users: users, history: history)
-                            }
-                            .foregroundColor(.red)
-                            .frame(maxWidth: .infinity)
-                            .padding()
+                            appVM.history.remove(atOffsets: offsets)
+                            appVM.persist()
                         }
                     }
                 }
@@ -913,63 +1047,16 @@ struct HistoryView: View {
     }
 }
 
-// MARK: - QUEJAS
-struct ClaimView: View {
-    let order: PastOrder
-    @State private var text = ""
-    @State private var sent = false
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        Form {
-            Section("Detalles") {
-                Text(order.items)
-            }
-
-            Section("¿Qué pasó?") {
-                TextEditor(text: $text)
-                    .frame(height: 100)
-            }
-
-            Button("Enviar Reporte") {
-                sent = true
-            }
-            .disabled(text.isEmpty)
-        }
-        .navigationTitle("Reporte")
-        .fullScreenCover(isPresented: $sent) {
-            VStack(spacing: 20) {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 80))
-                    .foregroundColor(.blue)
-
-                Text("Reporte Enviado")
-                    .font(.title)
-                    .bold()
-
-                Button("Entendido") {
-                    sent = false
-                    dismiss()
-                }
-                .padding()
-                .background(Color.blue)
-                .foregroundColor(.white)
-                .cornerRadius(10)
-            }
-        }
-    }
-}
-
 // MARK: - AJUSTES
 struct SettingsView: View {
-    @Binding var users: [UserProfile]
-    @Binding var history: [PastOrder]
-    @Binding var loggedEmail: String?
+    @EnvironmentObject var appVM: AppViewModel
 
     @State private var nName = ""
     @State private var nGrade = ""
     @State private var nEmail = ""
-    @State private var emailError = ""
+    @State private var nCardNumber = ""
+    @State private var nIdentifierCode = ""
+    @State private var formError = ""
 
     var body: some View {
         NavigationStack {
@@ -978,99 +1065,109 @@ struct SettingsView: View {
                     HStack {
                         Image(systemName: "envelope.badge.fill")
                             .foregroundColor(.accentColor)
-                        Text(loggedEmail ?? "Sin sesión")
+                        Text(appVM.loggedEmail ?? "Sin sesión")
                             .font(.subheadline)
                     }
 
                     Button("Cerrar sesión") {
                         cerrarSesionLocal()
-                        loggedEmail = nil
+                        appVM.loggedEmail = nil
+                        appVM.stopServerSync()
                     }
                     .foregroundColor(.red)
                 }
 
-                Section("Usuarios / Estudiantes") {
-                    ForEach(users) { user in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("\(user.name) (\(user.grade))")
-                                    .font(.headline)
-                                Spacer()
-                                Button(action: {
-                                    users.removeAll(where: { $0.id == user.id })
-                                    guardarEnTelefono(users: users, history: history)
-                                }) {
-                                    Image(systemName: "trash")
-                                        .foregroundColor(.red)
-                                }
-                                .buttonStyle(BorderlessButtonStyle())
-                            }
+                Section("Estudiantes registrados") {
+                    if appVM.users.isEmpty {
+                        Text("No hay estudiantes registrados.")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(appVM.users) { user in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("\(user.name) (\(user.grade))")
+                                        .font(.headline)
 
-                            if !user.email.isEmpty {
+                                    Spacer()
+
+                                    Button {
+                                        appVM.removeStudent(user)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .foregroundColor(.red)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+
                                 Text(user.email)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
+
+                                Text("Tarjeta: \(tarjetaEnmascarada(user.studentCardNumber))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+
+                                Text("Código: \(user.identifierCode)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+
+                                Text("Saldo del servidor: \(money(user.accountFunds))")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.accentColor)
                             }
-
-                            Text("Tarjeta: \(formatearNumeroTarjeta(user.studentCardNumber))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            Text("Código identificador: \(user.identifierCode)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            Text("Fondos: $\(user.accountFunds, specifier: "%.2f")")
-                                .font(.caption.bold())
-                                .foregroundColor(.accentColor)
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
+                    }
+                }
+
+                Section("Agregar estudiante con tarjeta manual") {
+                    TextField("Nombre", text: $nName)
+                    TextField("Grado", text: $nGrade)
+
+                    TextField("Correo institucional", text: $nEmail)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    TextField("Número de tarjeta", text: $nCardNumber)
+                        .keyboardType(.numberPad)
+
+                    TextField("Código identificador", text: $nIdentifierCode)
+                        .textInputAutocapitalization(.characters)
+
+                    if !formError.isEmpty {
+                        Text(formError)
+                            .font(.caption)
+                            .foregroundColor(.red)
                     }
 
-                    DisclosureGroup("Añadir Usuario") {
-                        TextField("Nombre", text: $nName)
-                        TextField("Grado", text: $nGrade)
+                    Button("Guardar") {
+                        let ok = appVM.addStudent(
+                            name: nName,
+                            grade: nGrade,
+                            email: nEmail,
+                            cardNumber: nCardNumber,
+                            identifierCode: nIdentifierCode
+                        )
 
-                        TextField("Correo institucional", text: $nEmail)
-                            .keyboardType(.emailAddress)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-
-                        if !emailError.isEmpty {
-                            Text(emailError)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                        }
-
-                        Button("Guardar") {
-                            let cleanEmail = normalizarCorreo(nEmail)
-
-                            guard correoWaldenValido(cleanEmail) else {
-                                emailError = "El estudiante debe usar correo @waldendos.edu.mx"
-                                return
-                            }
-
-                            emailError = ""
-
-                            users.append(
-                                UserProfile(
-                                    name: nName,
-                                    age: 15,
-                                    grade: nGrade,
-                                    email: cleanEmail,
-                                    studentCardNumber: generarNumeroTarjetaEstudiantil(),
-                                    identifierCode: generarCodigoIdentificador(),
-                                    accountFunds: 1000.0
-                                )
-                            )
-
-                            guardarEnTelefono(users: users, history: history)
+                        if ok {
+                            formError = ""
                             nName = ""
                             nGrade = ""
                             nEmail = ""
+                            nCardNumber = ""
+                            nIdentifierCode = ""
+                        } else {
+                            formError = "Revisa nombre, grado, correo institucional, número de tarjeta y código."
                         }
-                        .disabled(nName.isEmpty || nGrade.isEmpty || nEmail.isEmpty)
                     }
+                    .disabled(
+                        nName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        nGrade.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        nEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        nCardNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        nIdentifierCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
                 }
             }
             .navigationTitle("Ajustes")
@@ -1080,9 +1177,7 @@ struct SettingsView: View {
 
 // MARK: - CUENTA
 struct AccountView: View {
-    @Binding var users: [UserProfile]
-    @Binding var history: [PastOrder]
-    @Binding var loggedEmail: String?
+    @EnvironmentObject var appVM: AppViewModel
 
     var body: some View {
         NavigationStack {
@@ -1098,10 +1193,10 @@ struct AccountView: View {
                                 .foregroundColor(.accentColor)
 
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(loggedEmail ?? "Sin correo")
+                                Text(appVM.loggedEmail ?? "Sin correo")
                                     .font(.headline)
 
-                                Text("Acceso válido para Walden Dos")
+                                Text("Tarjetas registradas manualmente")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -1117,11 +1212,11 @@ struct AccountView: View {
                         Text("Tarjetas estudiantiles")
                             .font(.title3.bold())
 
-                        if users.isEmpty {
+                        if appVM.users.isEmpty {
                             Text("No hay cuentas de estudiantes registradas.")
                                 .foregroundColor(.secondary)
                         } else {
-                            ForEach(users.indices, id: \.self) { index in
+                            ForEach(appVM.users) { user in
                                 VStack(spacing: 14) {
                                     VStack(alignment: .leading, spacing: 14) {
                                         HStack {
@@ -1130,7 +1225,7 @@ struct AccountView: View {
                                                     .font(.caption.bold())
                                                     .foregroundColor(.white.opacity(0.85))
 
-                                                Text(users[index].name)
+                                                Text(user.name)
                                                     .font(.title3.bold())
                                                     .foregroundColor(.white)
                                             }
@@ -1143,15 +1238,15 @@ struct AccountView: View {
                                         }
 
                                         VStack(alignment: .leading, spacing: 10) {
-                                            Text(formatearNumeroTarjeta(users[index].studentCardNumber))
+                                            Text(formatearNumeroTarjeta(user.studentCardNumber))
                                                 .font(.system(size: 24, weight: .bold, design: .monospaced))
                                                 .foregroundColor(.white)
 
-                                            Text("Código identificador: \(users[index].identifierCode)")
+                                            Text("Código identificador: \(user.identifierCode)")
                                                 .font(.subheadline)
                                                 .foregroundColor(.white.opacity(0.92))
 
-                                            Text("Saldo disponible: $\(users[index].accountFunds, specifier: "%.2f")")
+                                            Text("Saldo leído del servidor: \(money(user.accountFunds))")
                                                 .font(.headline.bold())
                                                 .foregroundColor(.white)
                                         }
@@ -1167,40 +1262,15 @@ struct AccountView: View {
                                     )
                                     .clipShape(RoundedRectangle(cornerRadius: 24))
 
-                                    VStack(spacing: 10) {
-                                        Button("Recargar $100") {
-                                            users[index].accountFunds += 100
-                                            guardarEnTelefono(users: users, history: history)
-                                        }
-                                        .font(.subheadline.bold())
-                                        .foregroundColor(.white)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 12)
-                                        .background(Color.green)
-                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("El saldo ya no se cambia aquí.")
+                                            .font(.subheadline.bold())
 
-                                        Button("Recargar $500") {
-                                            users[index].accountFunds += 500
-                                            guardarEnTelefono(users: users, history: history)
-                                        }
-                                        .font(.subheadline.bold())
-                                        .foregroundColor(.white)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 12)
-                                        .background(Color.accentColor)
-                                        .clipShape(RoundedRectangle(cornerRadius: 14))
-
-                                        Button("Generar nueva tarjeta") {
-                                            users[index].studentCardNumber = generarNumeroTarjetaEstudiantil()
-                                            users[index].identifierCode = generarCodigoIdentificador()
-                                            guardarEnTelefono(users: users, history: history)
-                                        }
-                                        .font(.subheadline.bold())
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 12)
-                                        .background(Color(UIColor.secondarySystemBackground))
-                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                                        Text("Debe actualizarse desde Firestore, panel admin o backend. Esta vista solo lo muestra en tiempo real.")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
                                     }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 .padding()
                                 .background(Color(UIColor.systemBackground))
