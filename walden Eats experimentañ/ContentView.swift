@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import Combine
 import FirebaseCore
 import FirebaseFirestore
 
@@ -178,14 +180,19 @@ final class FirebaseWalletService: ObservableObject {
         listeners.removeAll()
     }
 
-    func syncUsersBalances(users: Binding<[UserProfile]>, history: Binding<[PastOrder]>) {
+    func syncUsersBalances(appVM: AppViewModel) {
         stopListeners()
 
-        for user in users.wrappedValue {
+        for user in appVM.users {
             guard !user.email.isEmpty else { continue }
             let docID = normalizarCorreo(user.email)
 
-            let listener = db.collection("students").document(docID).addSnapshotListener { snapshot, _ in
+            let listener = db.collection("students").document(docID).addSnapshotListener { snapshot, error in
+                if let error = error {
+                    print("❌ Error escuchando saldo de \(docID): \(error.localizedDescription)")
+                    return
+                }
+
                 guard let data = snapshot?.data() else { return }
 
                 let remoteFunds = data["accountFunds"] as? Double ?? (data["accountFunds"] as? NSNumber)?.doubleValue ?? 0.0
@@ -193,11 +200,11 @@ final class FirebaseWalletService: ObservableObject {
                 let remoteCode = data["identifierCode"] as? String ?? user.identifierCode
 
                 DispatchQueue.main.async {
-                    if let index = users.wrappedValue.firstIndex(where: { normalizarCorreo($0.email) == docID }) {
-                        users.wrappedValue[index].accountFunds = remoteFunds
-                        users.wrappedValue[index].studentCardNumber = remoteCard
-                        users.wrappedValue[index].identifierCode = remoteCode
-                        guardarEnTelefono(users: users.wrappedValue, history: history.wrappedValue)
+                    if let index = appVM.users.firstIndex(where: { normalizarCorreo($0.email) == docID }) {
+                        appVM.users[index].accountFunds = remoteFunds
+                        appVM.users[index].studentCardNumber = remoteCard
+                        appVM.users[index].identifierCode = remoteCode
+                        guardarEnTelefono(users: appVM.users, history: appVM.history)
                     }
                 }
             }
@@ -219,7 +226,13 @@ final class FirebaseWalletService: ObservableObject {
             "identifierCode": user.identifierCode,
             "accountFunds": user.accountFunds,
             "updatedAt": FieldValue.serverTimestamp()
-        ], merge: true)
+        ], merge: true) { error in
+            if let error = error {
+                print("❌ Error actualizando alumno: \(error.localizedDescription)")
+            } else {
+                print("✅ Alumno actualizado en students/\(docID)")
+            }
+        }
     }
 
     func sendOrder(
@@ -232,21 +245,25 @@ final class FirebaseWalletService: ObservableObject {
         let itemsText = agruparItems(cart)
         let total = cart.reduce(0) { $0 + $1.price }
 
-        db.collection("pedidos").document(orderID).setData([
+        let data: [String: Any] = [
             "orderID": orderID,
             "userName": user.name,
             "email": normalizarCorreo(user.email),
             "items": itemsText,
             "total": total,
             "recess": recess,
-            "timestamp": FieldValue.serverTimestamp(),
-            "status": "completado",
+            "timestamp": Timestamp(date: Date()),
+            "status": "pendiente", // IMPORTANTE: Gourmet debe ver pedidos pendientes
             "studentCardNumber": user.studentCardNumber,
             "identifierCode": user.identifierCode
-        ]) { error in
+        ]
+
+        db.collection("pedidos").document(orderID).setData(data) { error in
             if let error = error {
+                print("❌ Error al guardar pedido en Firebase: \(error.localizedDescription)")
                 completion(.failure(error))
             } else {
+                print("✅ Pedido guardado en Firebase con ID: \(orderID)")
                 completion(.success(orderID))
             }
         }
@@ -292,8 +309,10 @@ final class FirebaseWalletService: ObservableObject {
             return nil
         }) { _, error in
             if let error = error {
+                print("❌ Error descontando saldo: \(error.localizedDescription)")
                 completion(.failure(error))
             } else {
+                print("✅ Saldo descontado correctamente")
                 completion(.success(()))
             }
         }
@@ -320,7 +339,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startServerSync() {
-        firebase.syncUsersBalances(users: $users, history: $history)
+        firebase.syncUsersBalances(appVM: self)
     }
 
     func stopServerSync() {
@@ -330,13 +349,17 @@ final class AppViewModel: ObservableObject {
     func addStudent(name: String, grade: String, email: String, cardNumber: String, identifierCode: String) -> Bool {
         let cleanEmail = normalizarCorreo(email)
         let cleanCard = cardNumber.replacingOccurrences(of: " ", with: "")
-        let cleanCode = identifierCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCode = identifierCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
         guard correoWaldenValido(cleanEmail) else { return false }
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         guard !grade.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         guard !cleanCard.isEmpty else { return false }
         guard !cleanCode.isEmpty else { return false }
+
+        if users.contains(where: { normalizarCorreo($0.email) == cleanEmail }) {
+            return false
+        }
 
         let newUser = UserProfile(
             name: name,
@@ -863,6 +886,7 @@ struct CheckoutView: View {
     @State private var selectedRecess = "1er Receso"
     @State private var showSuccess = false
     @State private var paymentError = ""
+    @State private var isProcessing = false
 
     var totalOrder: Double {
         appVM.cart.reduce(0) { $0 + $1.price }
@@ -921,66 +945,21 @@ struct CheckoutView: View {
                             .font(.caption)
                     }
 
-                    Button("Confirmar Pedido") {
-                        guard appVM.users.indices.contains(selectedUserIndex) else { return }
-                        let user = appVM.users[selectedUserIndex]
-
-                        guard !user.studentCardNumber.isEmpty else {
-                            paymentError = "El estudiante no tiene una tarjeta registrada."
-                            return
-                        }
-
-                        guard !user.identifierCode.isEmpty else {
-                            paymentError = "El estudiante no tiene código identificador."
-                            return
-                        }
-
-                        guard user.accountFunds >= totalOrder else {
-                            paymentError = "Saldo insuficiente según el servidor."
-                            return
-                        }
-
-                        paymentError = ""
-
-                        appVM.firebase.sendOrder(
-                            user: user,
-                            cart: appVM.cart,
-                            recess: selectedRecess
-                        ) { result in
-                            DispatchQueue.main.async {
-                                switch result {
-                                case .success(let orderID):
-                                    appVM.firebase.deductBalance(for: user, amount: totalOrder) { balanceResult in
-                                        DispatchQueue.main.async {
-                                            switch balanceResult {
-                                            case .success:
-                                                let order = PastOrder(
-                                                    orderID: orderID,
-                                                    date: Date(),
-                                                    userName: user.name,
-                                                    items: agruparItems(appVM.cart),
-                                                    total: totalOrder,
-                                                    recess: selectedRecess,
-                                                    status: "completado"
-                                                )
-                                                appVM.history.insert(order, at: 0)
-                                                appVM.persist()
-                                                showSuccess = true
-
-                                            case .failure(let error):
-                                                paymentError = "Pedido enviado, pero no se pudo descontar saldo: \(error.localizedDescription)"
-                                            }
-                                        }
-                                    }
-
-                                case .failure(let error):
-                                    paymentError = error.localizedDescription
-                                }
+                    Button {
+                        confirmOrder()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if isProcessing {
+                                ProgressView()
+                            } else {
+                                Text("Confirmar Pedido")
+                                    .bold()
                             }
+                            Spacer()
                         }
                     }
-                    .bold()
-                    .frame(maxWidth: .infinity)
+                    .disabled(isProcessing || appVM.users.isEmpty || appVM.cart.isEmpty)
                     .foregroundColor(.accentColor)
                 }
             }
@@ -992,11 +971,11 @@ struct CheckoutView: View {
                     .font(.system(size: 82))
                     .foregroundColor(.green)
 
-                Text("Pedido completado")
+                Text("Pedido enviado")
                     .font(.largeTitle)
                     .bold()
 
-                Text("El pedido se guardó y el saldo se descontó en Firebase.")
+                Text("El pedido se guardó como pendiente y el saldo se descontó en Firebase.")
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
@@ -1012,6 +991,73 @@ struct CheckoutView: View {
                 .cornerRadius(10)
             }
             .padding()
+        }
+    }
+
+    private func confirmOrder() {
+        guard appVM.users.indices.contains(selectedUserIndex) else { return }
+        let user = appVM.users[selectedUserIndex]
+
+        guard !user.studentCardNumber.isEmpty else {
+            paymentError = "El estudiante no tiene una tarjeta registrada."
+            return
+        }
+
+        guard !user.identifierCode.isEmpty else {
+            paymentError = "El estudiante no tiene código identificador."
+            return
+        }
+
+        guard user.accountFunds >= totalOrder else {
+            paymentError = "Saldo insuficiente según el servidor."
+            return
+        }
+
+        paymentError = ""
+        isProcessing = true
+
+        let itemsSnapshot = appVM.cart
+        let totalSnapshot = totalOrder
+
+        appVM.firebase.sendOrder(
+            user: user,
+            cart: itemsSnapshot,
+            recess: selectedRecess
+        ) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let orderID):
+                    appVM.firebase.deductBalance(for: user, amount: totalSnapshot) { balanceResult in
+                        DispatchQueue.main.async {
+                            isProcessing = false
+
+                            switch balanceResult {
+                            case .success:
+                                let order = PastOrder(
+                                    orderID: orderID,
+                                    date: Date(),
+                                    userName: user.name,
+                                    items: agruparItems(itemsSnapshot),
+                                    total: totalSnapshot,
+                                    recess: selectedRecess,
+                                    status: "pendiente"
+                                )
+                                appVM.history.insert(order, at: 0)
+                                appVM.persist()
+                                appVM.startServerSync()
+                                showSuccess = true
+
+                            case .failure(let error):
+                                paymentError = "Pedido enviado, pero no se pudo descontar saldo: \(error.localizedDescription)"
+                            }
+                        }
+                    }
+
+                case .failure(let error):
+                    isProcessing = false
+                    paymentError = error.localizedDescription
+                }
+            }
         }
     }
 }
@@ -1062,7 +1108,9 @@ struct HistoryView: View {
                                     Text(order.status.capitalized)
                                         .font(.caption.bold())
                                         .padding(6)
-                                        .background(Color.green.opacity(0.12))
+                                        .background(
+                                            (order.status.lowercased() == "pendiente" ? Color.orange : Color.green).opacity(0.12)
+                                        )
                                         .cornerRadius(8)
 
                                     Spacer()
@@ -1196,7 +1244,7 @@ struct SettingsView: View {
                             nCardNumber = ""
                             nIdentifierCode = ""
                         } else {
-                            formError = "Revisa nombre, grado, correo institucional, número de tarjeta y código."
+                            formError = "Revisa nombre, grado, correo institucional, número de tarjeta y código. También puede que ese correo ya esté registrado."
                         }
                     }
                     .disabled(
@@ -1317,3 +1365,4 @@ struct AccountView: View {
         }
     }
 }
+
