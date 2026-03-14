@@ -1,9 +1,8 @@
 import SwiftUI
-import Combine
 import FirebaseCore
 import FirebaseFirestore
 
-// MARK: - CONFIGURACIÓN DE FIREBASE
+// MARK: - FIREBASE APP DELEGATE
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
@@ -21,12 +20,8 @@ struct UserProfile: Identifiable, Codable, Equatable {
     var age: Int
     var grade: String
     var email: String = ""
-
-    // Tarjeta manual
     var studentCardNumber: String = ""
     var identifierCode: String = ""
-
-    // Saldo leído desde servidor
     var accountFunds: Double = 0.0
 
     enum CodingKeys: String, CodingKey {
@@ -95,7 +90,7 @@ struct PastOrder: Identifiable, Codable, Equatable {
     let status: String
 }
 
-// MARK: - SESIÓN
+// MARK: - HELPERS
 func normalizarCorreo(_ email: String) -> String {
     email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 }
@@ -117,7 +112,6 @@ func cerrarSesionLocal() {
     UserDefaults.standard.removeObject(forKey: "WaldenLoggedEmail")
 }
 
-// MARK: - GUARDADO LOCAL
 func guardarEnTelefono(users: [UserProfile], history: [PastOrder]) {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -145,7 +139,6 @@ func cargarHistorialLocal() -> [PastOrder] {
     return (try? decoder.decode([PastOrder].self, from: data)) ?? []
 }
 
-// MARK: - HELPERS
 func agruparItems(_ items: [FoodItem]) -> String {
     let dict = Dictionary(grouping: items, by: { $0.name })
     let contados = dict.map { "\($0.value.count)x \($0.key)" }
@@ -164,15 +157,14 @@ func formatearNumeroTarjeta(_ number: String) -> String {
 func tarjetaEnmascarada(_ number: String) -> String {
     let limpio = number.replacingOccurrences(of: " ", with: "")
     guard limpio.count >= 4 else { return limpio }
-    let ultimos4 = String(limpio.suffix(4))
-    return "•••• •••• •••• \(ultimos4)"
+    return "•••• •••• •••• \(limpio.suffix(4))"
 }
 
 func money(_ value: Double) -> String {
     String(format: "$%.2f", value)
 }
 
-// MARK: - REPOSITORIO FIREBASE
+// MARK: - FIREBASE SERVICE
 final class FirebaseWalletService: ObservableObject {
     private let db = Firestore.firestore()
     private var listeners: [ListenerRegistration] = []
@@ -186,27 +178,26 @@ final class FirebaseWalletService: ObservableObject {
         listeners.removeAll()
     }
 
-    func syncUsersBalances(appVM: AppViewModel) {
+    func syncUsersBalances(users: Binding<[UserProfile]>, history: Binding<[PastOrder]>) {
         stopListeners()
 
-        for user in appVM.users {
+        for user in users.wrappedValue {
             guard !user.email.isEmpty else { continue }
-
             let docID = normalizarCorreo(user.email)
 
             let listener = db.collection("students").document(docID).addSnapshotListener { snapshot, _ in
                 guard let data = snapshot?.data() else { return }
 
-                let remoteFunds = data["accountFunds"] as? Double ?? data["accountFunds"] as? NSNumber as? Double ?? 0.0
+                let remoteFunds = data["accountFunds"] as? Double ?? (data["accountFunds"] as? NSNumber)?.doubleValue ?? 0.0
                 let remoteCard = data["studentCardNumber"] as? String ?? user.studentCardNumber
                 let remoteCode = data["identifierCode"] as? String ?? user.identifierCode
 
                 DispatchQueue.main.async {
-                    if let index = appVM.users.firstIndex(where: { normalizarCorreo($0.email) == docID }) {
-                        appVM.users[index].accountFunds = remoteFunds
-                        appVM.users[index].studentCardNumber = remoteCard
-                        appVM.users[index].identifierCode = remoteCode
-                        guardarEnTelefono(users: appVM.users, history: appVM.history)
+                    if let index = users.wrappedValue.firstIndex(where: { normalizarCorreo($0.email) == docID }) {
+                        users.wrappedValue[index].accountFunds = remoteFunds
+                        users.wrappedValue[index].studentCardNumber = remoteCard
+                        users.wrappedValue[index].identifierCode = remoteCode
+                        guardarEnTelefono(users: users.wrappedValue, history: history.wrappedValue)
                     }
                 }
             }
@@ -217,7 +208,6 @@ final class FirebaseWalletService: ObservableObject {
 
     func createOrUpdateStudent(_ user: UserProfile) {
         guard !user.email.isEmpty else { return }
-
         let docID = normalizarCorreo(user.email)
 
         db.collection("students").document(docID).setData([
@@ -250,7 +240,7 @@ final class FirebaseWalletService: ObservableObject {
             "total": total,
             "recess": recess,
             "timestamp": FieldValue.serverTimestamp(),
-            "status": "pendiente",
+            "status": "completado",
             "studentCardNumber": user.studentCardNumber,
             "identifierCode": user.identifierCode
         ]) { error in
@@ -258,6 +248,53 @@ final class FirebaseWalletService: ObservableObject {
                 completion(.failure(error))
             } else {
                 completion(.success(orderID))
+            }
+        }
+    }
+
+    func deductBalance(
+        for user: UserProfile,
+        amount: Double,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let docID = normalizarCorreo(user.email)
+        let studentRef = db.collection("students").document(docID)
+
+        db.runTransaction({ transaction, errorPointer -> Any? in
+            let snapshot: DocumentSnapshot
+            do {
+                snapshot = try transaction.getDocument(studentRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            let currentFunds = snapshot.data()?["accountFunds"] as? Double
+                ?? (snapshot.data()?["accountFunds"] as? NSNumber)?.doubleValue
+                ?? 0.0
+
+            let newBalance = currentFunds - amount
+            if newBalance < 0 {
+                let error = NSError(
+                    domain: "FirebaseWalletService",
+                    code: 1001,
+                    userInfo: [NSLocalizedDescriptionKey: "Saldo insuficiente en servidor."]
+                )
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            transaction.updateData([
+                "accountFunds": newBalance,
+                "updatedAt": FieldValue.serverTimestamp()
+            ], forDocument: studentRef)
+
+            return nil
+        }) { _, error in
+            if let error = error {
+                completion(.failure(error))
+            } else {
+                completion(.success(()))
             }
         }
     }
@@ -283,7 +320,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func startServerSync() {
-        firebase.syncUsersBalances(appVM: self)
+        firebase.syncUsersBalances(users: $users, history: $history)
     }
 
     func stopServerSync() {
@@ -325,7 +362,7 @@ final class AppViewModel: ObservableObject {
     }
 }
 
-// MARK: - PUNTO DE ENTRADA
+// MARK: - APP
 @main
 struct WaldenEatsApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
@@ -339,7 +376,7 @@ struct WaldenEatsApp: App {
     }
 }
 
-// MARK: - VISTA PRINCIPAL
+// MARK: - ROOT VIEW
 struct ContentView: View {
     @EnvironmentObject var appVM: AppViewModel
     @State private var showSplash = true
@@ -534,7 +571,7 @@ struct LoginView: View {
     }
 }
 
-// MARK: - MENÚ
+// MARK: - MENU
 struct MenuView: View {
     @EnvironmentObject var appVM: AppViewModel
     @State private var expandedCategories: Set<String> = [
@@ -743,7 +780,6 @@ struct MenuView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Enviar pedido")
                                     .font(.headline.bold())
-
                                 Text("\(appVM.cart.count) artículo(s)")
                                     .font(.caption)
                                     .foregroundColor(.white.opacity(0.88))
@@ -858,21 +894,14 @@ struct CheckoutView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Tarjeta registrada manualmente")
                             .font(.headline)
-
                         Text("Número: \(formatearNumeroTarjeta(user.studentCardNumber))")
                             .font(.subheadline)
-
                         Text("Código identificador: \(user.identifierCode)")
                             .font(.caption)
                             .foregroundColor(.secondary)
-
                         Text("Saldo en servidor: \(money(user.accountFunds))")
                             .font(.headline)
                             .foregroundColor(.green)
-
-                        Text("El descuento real debe hacerlo el servidor o panel admin.")
-                            .font(.caption)
-                            .foregroundColor(.orange)
                     }
                     .padding(.vertical, 6)
                 }
@@ -894,7 +923,6 @@ struct CheckoutView: View {
 
                     Button("Confirmar Pedido") {
                         guard appVM.users.indices.contains(selectedUserIndex) else { return }
-
                         let user = appVM.users[selectedUserIndex]
 
                         guard !user.studentCardNumber.isEmpty else {
@@ -922,18 +950,28 @@ struct CheckoutView: View {
                             DispatchQueue.main.async {
                                 switch result {
                                 case .success(let orderID):
-                                    let order = PastOrder(
-                                        orderID: orderID,
-                                        date: Date(),
-                                        userName: user.name,
-                                        items: agruparItems(appVM.cart),
-                                        total: totalOrder,
-                                        recess: selectedRecess,
-                                        status: "pendiente"
-                                    )
-                                    appVM.history.insert(order, at: 0)
-                                    appVM.persist()
-                                    showSuccess = true
+                                    appVM.firebase.deductBalance(for: user, amount: totalOrder) { balanceResult in
+                                        DispatchQueue.main.async {
+                                            switch balanceResult {
+                                            case .success:
+                                                let order = PastOrder(
+                                                    orderID: orderID,
+                                                    date: Date(),
+                                                    userName: user.name,
+                                                    items: agruparItems(appVM.cart),
+                                                    total: totalOrder,
+                                                    recess: selectedRecess,
+                                                    status: "completado"
+                                                )
+                                                appVM.history.insert(order, at: 0)
+                                                appVM.persist()
+                                                showSuccess = true
+
+                                            case .failure(let error):
+                                                paymentError = "Pedido enviado, pero no se pudo descontar saldo: \(error.localizedDescription)"
+                                            }
+                                        }
+                                    }
 
                                 case .failure(let error):
                                     paymentError = error.localizedDescription
@@ -950,15 +988,15 @@ struct CheckoutView: View {
         .navigationTitle("Pago")
         .fullScreenCover(isPresented: $showSuccess) {
             VStack(spacing: 20) {
-                Image(systemName: "paperplane.circle.fill")
+                Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 82))
                     .foregroundColor(.green)
 
-                Text("Pedido enviado")
+                Text("Pedido completado")
                     .font(.largeTitle)
                     .bold()
 
-                Text("Se mandó al servidor como pendiente. El saldo debe ajustarse desde el panel o backend.")
+                Text("El pedido se guardó y el saldo se descontó en Firebase.")
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
@@ -978,7 +1016,7 @@ struct CheckoutView: View {
     }
 }
 
-// MARK: - HISTORIAL
+// MARK: - HISTORY
 struct HistoryView: View {
     @EnvironmentObject var appVM: AppViewModel
 
@@ -1024,7 +1062,7 @@ struct HistoryView: View {
                                     Text(order.status.capitalized)
                                         .font(.caption.bold())
                                         .padding(6)
-                                        .background(Color.orange.opacity(0.12))
+                                        .background(Color.green.opacity(0.12))
                                         .cornerRadius(8)
 
                                     Spacer()
@@ -1047,7 +1085,7 @@ struct HistoryView: View {
     }
 }
 
-// MARK: - AJUSTES
+// MARK: - SETTINGS
 struct SettingsView: View {
     @EnvironmentObject var appVM: AppViewModel
 
@@ -1175,7 +1213,7 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - CUENTA
+// MARK: - ACCOUNT
 struct AccountView: View {
     @EnvironmentObject var appVM: AppViewModel
 
@@ -1261,16 +1299,6 @@ struct AccountView: View {
                                         )
                                     )
                                     .clipShape(RoundedRectangle(cornerRadius: 24))
-
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        Text("El saldo ya no se cambia aquí.")
-                                            .font(.subheadline.bold())
-
-                                        Text("Debe actualizarse desde Firestore, panel admin o backend. Esta vista solo lo muestra en tiempo real.")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 .padding()
                                 .background(Color(UIColor.systemBackground))
