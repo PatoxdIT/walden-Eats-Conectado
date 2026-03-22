@@ -1,17 +1,44 @@
-import SwiftUI
+ import SwiftUI
 import UIKit
 import Combine
+import UserNotifications
 import FirebaseCore
 import FirebaseFirestore
 
 // MARK: - FIREBASE APP DELEGATE
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         FirebaseApp.configure()
+        configureNotifications(application: application)
         return true
+    }
+
+    private func configureNotifications(application: UIApplication) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error = error {
+                print("❌ Error pidiendo permisos de notificación: \(error.localizedDescription)")
+            } else {
+                print("✅ Permisos de notificación: \(granted)")
+            }
+        }
+
+        DispatchQueue.main.async {
+            application.registerForRemoteNotifications()
+        }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound, .badge])
     }
 }
 
@@ -89,7 +116,7 @@ struct PastOrder: Identifiable, Codable, Equatable {
     let items: String
     let total: Double
     let recess: String
-    let status: String
+    var status: String
 }
 
 // MARK: - HELPERS
@@ -166,22 +193,91 @@ func money(_ value: Double) -> String {
     String(format: "$%.2f", value)
 }
 
+func estadoPedidoLegible(_ status: String) -> String {
+    switch status.lowercased() {
+    case "pendiente":
+        return "Pendiente"
+    case "en preparación", "en preparacion":
+        return "En preparación"
+    case "listo", "listo para recoger":
+        return "Listo para recoger"
+    case "entregado":
+        return "Entregado"
+    default:
+        return status.capitalized
+    }
+}
+
+func colorEstado(_ status: String) -> Color {
+    switch status.lowercased() {
+    case "pendiente":
+        return .orange
+    case "en preparación", "en preparacion":
+        return .blue
+    case "listo", "listo para recoger":
+        return .green
+    case "entregado":
+        return .gray
+    default:
+        return .accentColor
+    }
+}
+
+func yaNotificadoPedido(_ orderID: String) -> Bool {
+    let ids = UserDefaults.standard.stringArray(forKey: "WaldenNotifiedReadyOrders") ?? []
+    return ids.contains(orderID)
+}
+
+func marcarPedidoComoNotificado(_ orderID: String) {
+    var ids = UserDefaults.standard.stringArray(forKey: "WaldenNotifiedReadyOrders") ?? []
+    if !ids.contains(orderID) {
+        ids.append(orderID)
+        UserDefaults.standard.set(ids, forKey: "WaldenNotifiedReadyOrders")
+    }
+}
+
+func mandarNotificacionPedidoListo(orderID: String, userName: String) {
+    let content = UNMutableNotificationContent()
+    content.title = "Pedido listo para recoger"
+    content.body = "Tu pedido #\(orderID) de \(userName) ya está listo para recoger."
+    content.sound = .default
+
+    let request = UNNotificationRequest(
+        identifier: "pedido-listo-\(orderID)",
+        content: content,
+        trigger: nil
+    )
+
+    UNUserNotificationCenter.current().add(request) { error in
+        if let error = error {
+            print("❌ Error enviando notificación local: \(error.localizedDescription)")
+        } else {
+            print("✅ Notificación local enviada para pedido \(orderID)")
+        }
+    }
+}
+
 // MARK: - FIREBASE SERVICE
 final class FirebaseWalletService: ObservableObject {
     private let db = Firestore.firestore()
     private var listeners: [ListenerRegistration] = []
+    private var ordersListener: ListenerRegistration?
 
     deinit {
         listeners.forEach { $0.remove() }
+        ordersListener?.remove()
     }
 
     func stopListeners() {
         listeners.forEach { $0.remove() }
         listeners.removeAll()
+        ordersListener?.remove()
+        ordersListener = nil
     }
 
     func syncUsersBalances(appVM: AppViewModel) {
-        stopListeners()
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
 
         for user in appVM.users {
             guard !user.email.isEmpty else { continue }
@@ -211,6 +307,65 @@ final class FirebaseWalletService: ObservableObject {
 
             listeners.append(listener)
         }
+    }
+
+    func listenOrders(for email: String, appVM: AppViewModel) {
+        ordersListener?.remove()
+        let cleanEmail = normalizarCorreo(email)
+
+        ordersListener = db.collection("pedidos")
+            .whereField("email", isEqualTo: cleanEmail)
+            .addSnapshotListener { snapshot, error in
+                if let error = error {
+                    print("❌ Error escuchando pedidos del usuario: \(error.localizedDescription)")
+                    return
+                }
+
+                guard let documents = snapshot?.documents else { return }
+
+                DispatchQueue.main.async {
+                    for doc in documents {
+                        let data = doc.data()
+                        let orderID = data["orderID"] as? String ?? doc.documentID
+                        let userName = data["userName"] as? String ?? "Alumno"
+                        let items = data["items"] as? String ?? ""
+                        let total = data["total"] as? Double ?? (data["total"] as? NSNumber)?.doubleValue ?? 0.0
+                        let recess = data["recess"] as? String ?? "1er Receso"
+                        let status = data["status"] as? String ?? "pendiente"
+                        let timestamp = (data["timestamp"] as? Timestamp)?.dateValue() ?? Date()
+
+                        if let index = appVM.history.firstIndex(where: { $0.orderID == orderID }) {
+                            let previousStatus = appVM.history[index].status
+                            appVM.history[index].status = status
+
+                            if previousStatus.lowercased() != status.lowercased() {
+                                print("🔄 Pedido \(orderID) cambió a estado: \(status)")
+                            }
+                        } else {
+                            let newOrder = PastOrder(
+                                orderID: orderID,
+                                date: timestamp,
+                                userName: userName,
+                                items: items,
+                                total: total,
+                                recess: recess,
+                                status: status
+                            )
+                            appVM.history.insert(newOrder, at: 0)
+                        }
+
+                        if status.lowercased() == "listo" || status.lowercased() == "listo para recoger" {
+                            if !yaNotificadoPedido(orderID) {
+                                mandarNotificacionPedidoListo(orderID: orderID, userName: userName)
+                                marcarPedidoComoNotificado(orderID)
+                            }
+                        }
+                    }
+
+                    appVM.history.sort { $0.date > $1.date }
+                    appVM.persist()
+                }
+            }
     }
 
     func createOrUpdateStudent(_ user: UserProfile) {
@@ -253,7 +408,7 @@ final class FirebaseWalletService: ObservableObject {
             "total": total,
             "recess": recess,
             "timestamp": Timestamp(date: Date()),
-            "status": "pendiente", // IMPORTANTE: Gourmet debe ver pedidos pendientes
+            "status": "pendiente",
             "studentCardNumber": user.studentCardNumber,
             "identifierCode": user.identifierCode
         ]
@@ -340,6 +495,10 @@ final class AppViewModel: ObservableObject {
 
     func startServerSync() {
         firebase.syncUsersBalances(appVM: self)
+
+        if let email = loggedEmail, !email.isEmpty {
+            firebase.listenOrders(for: email, appVM: self)
+        }
     }
 
     func stopServerSync() {
@@ -838,7 +997,7 @@ struct MenuView: View {
                         .font(.system(size: 30, weight: .heavy, design: .rounded))
                         .foregroundColor(.white)
 
-                    Text("Tarjeta manual y saldo desde servidor")
+                    Text("Tarjeta manual, saldo en servidor y avisos de pedido listo")
                         .font(.subheadline)
                         .foregroundColor(.white.opacity(0.92))
                 }
@@ -975,7 +1134,7 @@ struct CheckoutView: View {
                     .font(.largeTitle)
                     .bold()
 
-                Text("El pedido se guardó como pendiente y el saldo se descontó en Firebase.")
+                Text("El pedido se guardó como pendiente. Cuando Gourmet lo marque como listo, aquí se actualizará y te llegará un aviso.")
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
@@ -1105,12 +1264,11 @@ struct HistoryView: View {
                                         .background(Color.accentColor.opacity(0.12))
                                         .cornerRadius(8)
 
-                                    Text(order.status.capitalized)
+                                    Text(estadoPedidoLegible(order.status))
                                         .font(.caption.bold())
                                         .padding(6)
-                                        .background(
-                                            (order.status.lowercased() == "pendiente" ? Color.orange : Color.green).opacity(0.12)
-                                        )
+                                        .background(colorEstado(order.status).opacity(0.12))
+                                        .foregroundColor(colorEstado(order.status))
                                         .cornerRadius(8)
 
                                     Spacer()
@@ -1365,4 +1523,3 @@ struct AccountView: View {
         }
     }
 }
-
