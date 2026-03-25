@@ -4,6 +4,7 @@ import Combine
 import UserNotifications
 import FirebaseCore
 import FirebaseFirestore
+import CryptoKit
 
 // MARK: - FIREBASE APP DELEGATE
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -257,6 +258,21 @@ func mandarNotificacionPedidoListo(orderID: String, userName: String) {
     }
 }
 
+// MARK: - PASSWORD SECURITY
+func generarSalt() -> String {
+    UUID().uuidString.replacingOccurrences(of: "-", with: "")
+}
+
+func hashPassword(_ password: String, salt: String) -> String {
+    let input = salt + password
+    let digest = SHA256.hash(data: Data(input.utf8))
+    return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+func passwordFuerte(_ password: String) -> Bool {
+    password.trimmingCharacters(in: .whitespacesAndNewlines).count >= 8
+}
+
 // MARK: - FIREBASE SERVICE
 final class FirebaseWalletService: ObservableObject {
     private let db = Firestore.firestore()
@@ -275,6 +291,161 @@ final class FirebaseWalletService: ObservableObject {
         ordersListener = nil
     }
 
+    // MARK: ACCESS USERS
+    func createAccessUser(
+        email: String,
+        password: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let cleanEmail = normalizarCorreo(email)
+
+        guard correoWaldenValido(cleanEmail) else {
+            completion(.failure(NSError(
+                domain: "FirebaseWalletService",
+                code: 2001,
+                userInfo: [NSLocalizedDescriptionKey: "Solo se permiten correos institucionales."]
+            )))
+            return
+        }
+
+        guard passwordFuerte(password) else {
+            completion(.failure(NSError(
+                domain: "FirebaseWalletService",
+                code: 2002,
+                userInfo: [NSLocalizedDescriptionKey: "La contraseña debe tener mínimo 8 caracteres."]
+            )))
+            return
+        }
+
+        let ref = db.collection("accessUsers").document(cleanEmail)
+
+        ref.getDocument { snapshot, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            if snapshot?.exists == true {
+                completion(.failure(NSError(
+                    domain: "FirebaseWalletService",
+                    code: 2003,
+                    userInfo: [NSLocalizedDescriptionKey: "Ese correo ya tiene cuenta creada."]
+                )))
+                return
+            }
+
+            let salt = generarSalt()
+            let hash = hashPassword(password, salt: salt)
+
+            ref.setData([
+                "email": cleanEmail,
+                "passwordSalt": salt,
+                "passwordHash": hash,
+                "createdAt": FieldValue.serverTimestamp(),
+                "updatedAt": FieldValue.serverTimestamp()
+            ]) { error in
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    print("✅ Cuenta de acceso creada: \(cleanEmail)")
+                    completion(.success(()))
+                }
+            }
+        }
+    }
+
+    func verifyAccessUser(
+        email: String,
+        password: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let cleanEmail = normalizarCorreo(email)
+        let ref = db.collection("accessUsers").document(cleanEmail)
+
+        ref.getDocument { snapshot, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = snapshot?.data(), snapshot?.exists == true else {
+                completion(.failure(NSError(
+                    domain: "FirebaseWalletService",
+                    code: 2004,
+                    userInfo: [NSLocalizedDescriptionKey: "No existe una cuenta para ese correo."]
+                )))
+                return
+            }
+
+            let salt = data["passwordSalt"] as? String ?? ""
+            let savedHash = data["passwordHash"] as? String ?? ""
+
+            guard !salt.isEmpty, !savedHash.isEmpty else {
+                completion(.failure(NSError(
+                    domain: "FirebaseWalletService",
+                    code: 2005,
+                    userInfo: [NSLocalizedDescriptionKey: "La cuenta no tiene contraseña válida registrada."]
+                )))
+                return
+            }
+
+            let incomingHash = hashPassword(password, salt: salt)
+
+            if incomingHash == savedHash {
+                completion(.success(()))
+            } else {
+                completion(.failure(NSError(
+                    domain: "FirebaseWalletService",
+                    code: 2006,
+                    userInfo: [NSLocalizedDescriptionKey: "Contraseña incorrecta."]
+                )))
+            }
+        }
+    }
+
+    func updatePassword(
+        email: String,
+        currentPassword: String,
+        newPassword: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let cleanEmail = normalizarCorreo(email)
+
+        guard passwordFuerte(newPassword) else {
+            completion(.failure(NSError(
+                domain: "FirebaseWalletService",
+                code: 2007,
+                userInfo: [NSLocalizedDescriptionKey: "La nueva contraseña debe tener mínimo 8 caracteres."]
+            )))
+            return
+        }
+
+        verifyAccessUser(email: cleanEmail, password: currentPassword) { [weak self] result in
+            switch result {
+            case .success:
+                guard let self else { return }
+                let newSalt = generarSalt()
+                let newHash = hashPassword(newPassword, salt: newSalt)
+
+                self.db.collection("accessUsers").document(cleanEmail).setData([
+                    "passwordSalt": newSalt,
+                    "passwordHash": newHash,
+                    "updatedAt": FieldValue.serverTimestamp()
+                ], merge: true) { error in
+                    if let error = error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+
+            case .failure(let error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    // MARK: WALLET DATA
     func syncUsersBalances(appVM: AppViewModel) {
         listeners.forEach { $0.remove() }
         listeners.removeAll()
@@ -335,12 +506,7 @@ final class FirebaseWalletService: ObservableObject {
                         let timestamp = (data["timestamp"] as? Timestamp)?.dateValue() ?? Date()
 
                         if let index = appVM.history.firstIndex(where: { $0.orderID == orderID }) {
-                            let previousStatus = appVM.history[index].status
                             appVM.history[index].status = status
-
-                            if previousStatus.lowercased() != status.lowercased() {
-                                print("🔄 Pedido \(orderID) cambió a estado: \(status)")
-                            }
                         } else {
                             let newOrder = PastOrder(
                                 orderID: orderID,
@@ -480,6 +646,7 @@ final class AppViewModel: ObservableObject {
     @Published var history: [PastOrder] = []
     @Published var cart: [FoodItem] = []
     @Published var loggedEmail: String? = nil
+    @Published var isAuthenticating = false
 
     let firebase = FirebaseWalletService()
 
@@ -503,6 +670,80 @@ final class AppViewModel: ObservableObject {
 
     func stopServerSync() {
         firebase.stopListeners()
+    }
+
+    func login(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        let cleanEmail = normalizarCorreo(email)
+
+        guard correoWaldenValido(cleanEmail) else {
+            completion(.failure(NSError(
+                domain: "AppViewModel",
+                code: 3001,
+                userInfo: [NSLocalizedDescriptionKey: "Solo se permiten correos con dominio @waldendos.edu.mx"]
+            )))
+            return
+        }
+
+        guard !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(.failure(NSError(
+                domain: "AppViewModel",
+                code: 3002,
+                userInfo: [NSLocalizedDescriptionKey: "Ingresa una contraseña."]
+            )))
+            return
+        }
+
+        isAuthenticating = true
+
+        firebase.verifyAccessUser(email: cleanEmail, password: password) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.isAuthenticating = false
+
+                switch result {
+                case .success:
+                    guardarSesion(email: cleanEmail)
+                    self?.loggedEmail = cleanEmail
+                    self?.startServerSync()
+                    completion(.success(()))
+
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func registerAccess(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        isAuthenticating = true
+        firebase.createAccessUser(email: email, password: password) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.isAuthenticating = false
+                completion(result)
+            }
+        }
+    }
+
+    func changePassword(currentPassword: String, newPassword: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let email = loggedEmail else {
+            completion(.failure(NSError(
+                domain: "AppViewModel",
+                code: 3003,
+                userInfo: [NSLocalizedDescriptionKey: "No hay sesión activa."]
+            )))
+            return
+        }
+
+        firebase.updatePassword(email: email, currentPassword: currentPassword, newPassword: newPassword) { result in
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    func logout() {
+        cerrarSesionLocal()
+        loggedEmail = nil
+        stopServerSync()
     }
 
     func addStudent(name: String, grade: String, email: String, cardNumber: String, identifierCode: String) -> Bool {
@@ -653,6 +894,7 @@ struct LoginView: View {
     @State private var email = ""
     @State private var password = ""
     @State private var errorText = ""
+    @State private var showRegister = false
 
     var body: some View {
         NavigationStack {
@@ -686,9 +928,10 @@ struct LoginView: View {
                             Text("Inicio de sesión")
                                 .font(.system(size: 30, weight: .heavy, design: .rounded))
 
-                            Text("Solo pueden entrar correos institucionales")
+                            Text("Correo institucional y contraseña verificada con Firebase")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
                         }
 
                         VStack(spacing: 14) {
@@ -713,31 +956,29 @@ struct LoginView: View {
                             }
 
                             Button {
-                                let cleanEmail = normalizarCorreo(email)
-
-                                guard correoWaldenValido(cleanEmail) else {
-                                    errorText = "Solo se permiten correos con dominio @waldendos.edu.mx"
-                                    return
-                                }
-
-                                guard !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                                    errorText = "Ingresa una contraseña"
-                                    return
-                                }
-
-                                errorText = ""
-                                guardarSesion(email: cleanEmail)
-                                appVM.loggedEmail = cleanEmail
-                                appVM.startServerSync()
+                                login()
                             } label: {
-                                Text("Entrar")
-                                    .font(.headline.bold())
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .background(Color.accentColor)
-                                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                                HStack {
+                                    Spacer()
+                                    if appVM.isAuthenticating {
+                                        ProgressView().tint(.white)
+                                    } else {
+                                        Text("Entrar")
+                                            .font(.headline.bold())
+                                    }
+                                    Spacer()
+                                }
+                                .foregroundColor(.white)
+                                .padding()
+                                .background(Color.accentColor)
+                                .clipShape(RoundedRectangle(cornerRadius: 18))
                             }
+                            .disabled(appVM.isAuthenticating)
+
+                            Button("Crear cuenta") {
+                                showRegister = true
+                            }
+                            .disabled(appVM.isAuthenticating)
                         }
                         .padding(20)
                         .background(Color(UIColor.systemBackground))
@@ -748,6 +989,108 @@ struct LoginView: View {
                     }
                     .padding()
                 }
+            }
+            .sheet(isPresented: $showRegister) {
+                RegisterAccessView()
+            }
+        }
+    }
+
+    private func login() {
+        errorText = ""
+        appVM.login(email: email, password: password) { result in
+            switch result {
+            case .success:
+                errorText = ""
+            case .failure(let error):
+                errorText = error.localizedDescription
+            }
+        }
+    }
+}
+
+// MARK: - REGISTER ACCESS
+struct RegisterAccessView: View {
+    @EnvironmentObject var appVM: AppViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var email = ""
+    @State private var password = ""
+    @State private var confirmPassword = ""
+    @State private var errorText = ""
+    @State private var successText = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Crear cuenta de acceso") {
+                    TextField("correo@waldendos.edu.mx", text: $email)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    SecureField("Contraseña", text: $password)
+                    SecureField("Confirmar contraseña", text: $confirmPassword)
+
+                    Text("Mínimo 8 caracteres.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    if !errorText.isEmpty {
+                        Text(errorText)
+                            .foregroundColor(.red)
+                            .font(.caption)
+                    }
+
+                    if !successText.isEmpty {
+                        Text(successText)
+                            .foregroundColor(.green)
+                            .font(.caption)
+                    }
+
+                    Button {
+                        register()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if appVM.isAuthenticating {
+                                ProgressView()
+                            } else {
+                                Text("Crear cuenta").bold()
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Registro")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cerrar") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private func register() {
+        errorText = ""
+        successText = ""
+
+        guard password == confirmPassword else {
+            errorText = "Las contraseñas no coinciden."
+            return
+        }
+
+        appVM.registerAccess(email: email, password: password) { result in
+            switch result {
+            case .success:
+                successText = "Cuenta creada correctamente."
+                password = ""
+                confirmPassword = ""
+            case .failure(let error):
+                errorText = error.localizedDescription
             }
         }
     }
@@ -997,7 +1340,7 @@ struct MenuView: View {
                         .font(.system(size: 30, weight: .heavy, design: .rounded))
                         .foregroundColor(.white)
 
-                    Text("Tarjeta manual, saldo en servidor y avisos de pedido listo")
+                    Text("Tarjeta manual, saldo en servidor y login verificado")
                         .font(.subheadline)
                         .foregroundColor(.white.opacity(0.92))
                 }
@@ -1302,6 +1645,12 @@ struct SettingsView: View {
     @State private var nIdentifierCode = ""
     @State private var formError = ""
 
+    @State private var currentPassword = ""
+    @State private var newPassword = ""
+    @State private var confirmNewPassword = ""
+    @State private var passwordError = ""
+    @State private var passwordSuccess = ""
+
     var body: some View {
         NavigationStack {
             Form {
@@ -1314,11 +1663,35 @@ struct SettingsView: View {
                     }
 
                     Button("Cerrar sesión") {
-                        cerrarSesionLocal()
-                        appVM.loggedEmail = nil
-                        appVM.stopServerSync()
+                        appVM.logout()
                     }
                     .foregroundColor(.red)
+                }
+
+                Section("Cambiar contraseña") {
+                    SecureField("Contraseña actual", text: $currentPassword)
+                    SecureField("Nueva contraseña", text: $newPassword)
+                    SecureField("Confirmar nueva contraseña", text: $confirmNewPassword)
+
+                    Text("La nueva contraseña debe tener mínimo 8 caracteres.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    if !passwordError.isEmpty {
+                        Text(passwordError)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+
+                    if !passwordSuccess.isEmpty {
+                        Text(passwordSuccess)
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    }
+
+                    Button("Actualizar contraseña") {
+                        updatePassword()
+                    }
                 }
 
                 Section("Estudiantes registrados") {
@@ -1415,6 +1788,29 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Ajustes")
+        }
+    }
+
+    private func updatePassword() {
+        passwordError = ""
+        passwordSuccess = ""
+
+        guard newPassword == confirmNewPassword else {
+            passwordError = "Las nuevas contraseñas no coinciden."
+            return
+        }
+
+        appVM.changePassword(currentPassword: currentPassword, newPassword: newPassword) { result in
+            switch result {
+            case .success:
+                passwordSuccess = "Contraseña actualizada correctamente."
+                currentPassword = ""
+                newPassword = ""
+                confirmNewPassword = ""
+
+            case .failure(let error):
+                passwordError = error.localizedDescription
+            }
         }
     }
 }
