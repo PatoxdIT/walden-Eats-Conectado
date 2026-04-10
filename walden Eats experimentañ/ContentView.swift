@@ -194,6 +194,52 @@ func money(_ value: Double) -> String {
     String(format: "$%.2f", value)
 }
 
+func minutosDelDia(_ date: Date = Date()) -> Int {
+    let comps = Calendar.current.dateComponents([.hour, .minute], from: date)
+    return (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+}
+
+func sePuedePedir(recess: String, en date: Date = Date()) -> Bool {
+    let nowMinutes = minutosDelDia(date)
+    let inicio = 5 * 60 // 5:00 AM
+
+    switch recess {
+    case "1er Receso":
+        let cierre = (9 * 60) + 15 // 9:15 AM
+        return nowMinutes >= inicio && nowMinutes < cierre
+
+    case "2do Receso":
+        let cierre = (12 * 60) + 5 // 12:05 PM
+        return nowMinutes >= inicio && nowMinutes < cierre
+
+    default:
+        return false
+    }
+}
+
+func recesosDisponiblesHoy(en date: Date = Date()) -> [String] {
+    ["1er Receso", "2do Receso"].filter { sePuedePedir(recess: $0, en: date) }
+}
+
+func mensajeHorarioPedidos(en date: Date = Date()) -> String {
+    if sePuedePedir(recess: "1er Receso", en: date) && sePuedePedir(recess: "2do Receso", en: date) {
+        return "Puedes pedir para 1er y 2do receso."
+    } else if sePuedePedir(recess: "1er Receso", en: date) {
+        return "Solo puedes pedir para 1er receso hasta las 9:14 AM."
+    } else if sePuedePedir(recess: "2do Receso", en: date) {
+        return "Solo puedes pedir para 2do receso hasta las 12:04 PM."
+    } else {
+        return "Fuera de horario. El 1er receso se pide de 5:00 AM a 9:14 AM y el 2do de 5:00 AM a 12:04 PM."
+    }
+}
+
+func fechaPedidoTexto(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "es_MX")
+    formatter.dateFormat = "d/MMMM/yy"
+    return formatter.string(from: date).lowercased()
+}
+
 func estadoPedidoLegible(_ status: String) -> String {
     switch status.lowercased() {
     case "pendiente":
@@ -1303,7 +1349,7 @@ struct MenuView: View {
                     NavigationLink(destination: CheckoutView()) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Enviar pedido")
+                                Text(recesosDisponiblesHoy().isEmpty ? "Fuera de horario" : "Enviar pedido")
                                     .font(.headline.bold())
                                 Text("\(appVM.cart.count) artículo(s)")
                                     .font(.caption)
@@ -1321,10 +1367,11 @@ struct MenuView: View {
                         }
                         .foregroundColor(.white)
                         .padding()
-                        .background(Color.accentColor)
+                        .background(recesosDisponiblesHoy().isEmpty ? Color.gray : Color.accentColor)
                         .clipShape(RoundedRectangle(cornerRadius: 22))
                         .padding()
                     }
+                    .disabled(recesosDisponiblesHoy().isEmpty)
                 }
             }
             .navigationTitle("Menú")
@@ -1394,6 +1441,14 @@ struct CheckoutView: View {
         appVM.cart.reduce(0) { $0 + $1.price }
     }
 
+    var recesosDisponibles: [String] {
+        recesosDisponiblesHoy()
+    }
+
+    var puedeConfirmarPedido: Bool {
+        !recesosDisponibles.isEmpty && sePuedePedir(recess: selectedRecess)
+    }
+
     var body: some View {
         Form {
             if appVM.users.isEmpty {
@@ -1433,11 +1488,30 @@ struct CheckoutView: View {
                 }
 
                 Section("Entrega") {
-                    Picker("Receso", selection: $selectedRecess) {
-                        Text("1er Receso").tag("1er Receso")
-                        Text("2do Receso").tag("2do Receso")
+                    if recesosDisponibles.isEmpty {
+                        Text("Fuera de horario de pedidos.")
+                            .foregroundColor(.red)
+                            .font(.headline)
+
+                        Text("1er Receso (10:00): de 5:00 AM a 9:14 AM")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Text("2do Receso (12:50): de 5:00 AM a 12:04 PM")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Picker("Receso", selection: $selectedRecess) {
+                            ForEach(recesosDisponibles, id: \.self) { recess in
+                                Text(recess).tag(recess)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Text(mensajeHorarioPedidos())
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
-                    .pickerStyle(.segmented)
                 }
 
                 Section("Pedido") {
@@ -1461,9 +1535,19 @@ struct CheckoutView: View {
                             Spacer()
                         }
                     }
-                    .disabled(isProcessing || appVM.users.isEmpty || appVM.cart.isEmpty)
+                    .disabled(isProcessing || appVM.users.isEmpty || appVM.cart.isEmpty || !puedeConfirmarPedido)
                     .foregroundColor(.accentColor)
                 }
+            }
+        }
+        .onAppear {
+            if let primero = recesosDisponibles.first {
+                selectedRecess = primero
+            }
+        }
+        .onChange(of: recesosDisponibles) { _, nuevos in
+            if !nuevos.contains(selectedRecess), let primero = nuevos.first {
+                selectedRecess = primero
             }
         }
         .navigationTitle("Pago")
@@ -1498,6 +1582,12 @@ struct CheckoutView: View {
 
     private func confirmOrder() {
         guard appVM.users.indices.contains(selectedUserIndex) else { return }
+
+        guard sePuedePedir(recess: selectedRecess) else {
+            paymentError = "Ya no está disponible el horario para \(selectedRecess)."
+            return
+        }
+
         let user = appVM.users[selectedUserIndex]
 
         guard !user.studentCardNumber.isEmpty else {
@@ -1593,7 +1683,7 @@ struct HistoryView: View {
                                     Text("#\(order.orderID ?? "")")
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text(order.date, style: .date)
+                                    Text(fechaPedidoTexto(order.date))
                                         .font(.caption)
                                 }
 
