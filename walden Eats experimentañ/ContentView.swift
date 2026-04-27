@@ -92,20 +92,22 @@ struct UserProfile: Identifiable, Codable, Equatable {
 }
 
 struct FoodItem: Identifiable, Hashable, Codable {
-    let id: UUID
+    var id: String
     let name: String
     let price: Double
     let category: String
     let icon: String
     var dayOfWeek: Int?
+    var stock: Int
 
-    init(id: UUID = UUID(), name: String, price: Double, category: String, icon: String, dayOfWeek: Int? = nil) {
+    init(id: String = UUID().uuidString, name: String, price: Double, category: String, icon: String, dayOfWeek: Int? = nil, stock: Int = 0) {
         self.id = id
         self.name = name
         self.price = price
         self.category = category
         self.icon = icon
         self.dayOfWeek = dayOfWeek
+        self.stock = stock
     }
 }
 
@@ -324,10 +326,12 @@ final class FirebaseWalletService: ObservableObject {
     private let db = Firestore.firestore()
     private var listeners: [ListenerRegistration] = []
     private var ordersListener: ListenerRegistration?
+    private var inventoryListener: ListenerRegistration?
 
     deinit {
         listeners.forEach { $0.remove() }
         ordersListener?.remove()
+        inventoryListener?.remove()
     }
 
     func stopListeners() {
@@ -335,6 +339,8 @@ final class FirebaseWalletService: ObservableObject {
         listeners.removeAll()
         ordersListener?.remove()
         ordersListener = nil
+        inventoryListener?.remove()
+        inventoryListener = nil
     }
 
     // MARK: ACCESS USERS
@@ -526,6 +532,65 @@ final class FirebaseWalletService: ObservableObject {
         }
     }
 
+    // MARK: INVENTORY SYNC (VERSIÓN RAYOS X)
+    func listenToInventory(appVM: AppViewModel) {
+        inventoryListener?.remove()
+        
+        inventoryListener = db.collection("inventario").addSnapshotListener { snapshot, error in
+            if let error = error {
+                print("❌ Error escuchando inventario: \(error.localizedDescription)")
+                return
+            }
+            
+            guard let documents = snapshot?.documents else { return }
+            
+            DispatchQueue.main.async {
+                var menuTemporal = appVM.menu
+                var huboCambios = false
+                
+                print("📡 --- LEYENDO FIREBASE ---")
+                
+                for doc in documents {
+                    let itemName = doc.documentID.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let data = doc.data()
+                    
+                    // 🚨 ESTO NOS DIRÁ LA VERDAD ABSOLUTA
+                    print("📦 Firebase tiene el platillo: '\(itemName)' con estos datos: \(data)")
+                    
+                    // Intentamos leer el stock con varios nombres comunes por si Gourmet lo guarda diferente
+                    let rawStock = data["stock"] ?? data["Stock"] ?? data["cantidad"] ?? data["Cantidad"]
+                    var stockRecibido = 0
+                    
+                    if let num = rawStock as? Int {
+                        stockRecibido = num
+                    } else if let num = rawStock as? NSNumber {
+                        stockRecibido = num.intValue
+                    } else if let str = rawStock as? String, let num = Int(str) {
+                        stockRecibido = num
+                    } else if let str = rawStock as? String, let doubleVal = Double(str) {
+                        stockRecibido = Int(doubleVal)
+                    }
+                    
+                    if let index = menuTemporal.firstIndex(where: { $0.name.lowercased() == itemName.lowercased() }) {
+                        if menuTemporal[index].stock != stockRecibido {
+                            menuTemporal[index].stock = stockRecibido
+                            huboCambios = true
+                            print("🍔 [Inventario] \(itemName) SE ACTUALIZÓ A -> \(stockRecibido)")
+                        } else {
+                            print("🍔 [Inventario] \(itemName) se quedó igual en -> \(stockRecibido)")
+                        }
+                    } else {
+                        print("⚠️ [Inventario] '\(itemName)' está en Firebase pero NO en tu menú de Xcode.")
+                    }
+                }
+                
+                if huboCambios {
+                    appVM.menu = menuTemporal
+                }
+            }
+        }
+    }
+
     func listenOrders(for email: String, appVM: AppViewModel) {
         ordersListener?.remove()
         let cleanEmail = normalizarCorreo(email)
@@ -684,6 +749,25 @@ final class FirebaseWalletService: ObservableObject {
             }
         }
     }
+    
+    func deductInventory(cart: [FoodItem]) {
+        let batch = db.batch()
+        let agrupados = Dictionary(grouping: cart, by: { $0.name })
+
+        for (nombre, items) in agrupados {
+            let cantidadADescontar = items.count
+            let ref = db.collection("inventario").document(nombre)
+            batch.updateData(["cantidad": FieldValue.increment(Int64(-cantidadADescontar))], forDocument: ref)
+        }
+
+        batch.commit { error in
+            if let error = error {
+                print("❌ Error descontando inventario: \(error.localizedDescription)")
+            } else {
+                print("✅ Inventario actualizado correctamente en Firebase")
+            }
+        }
+    }
 }
 
 // MARK: - VIEW MODEL
@@ -691,6 +775,41 @@ final class AppViewModel: ObservableObject {
     @Published var users: [UserProfile] = []
     @Published var history: [PastOrder] = []
     @Published var cart: [FoodItem] = []
+    
+    @Published var menu: [FoodItem] = [
+        FoodItem(name: "Mollete", price: 15.0, category: "🌮 Platos", icon: "🥖", stock: 100),
+        FoodItem(name: "Torta de Salchicha", price: 35.0, category: "🌮 Platos", icon: "🥪", stock: 100),
+        FoodItem(name: "Sopes", price: 25.0, category: "🌮 Platos", icon: "🥙", stock: 100),
+        FoodItem(name: "Tacos de Frijol", price: 30.0, category: "🌮 Platos", icon: "🌮", stock: 100),
+        FoodItem(name: "Salchipulpos", price: 30.0, category: "🌮 Platos", icon: "🐙", stock: 100),
+        FoodItem(name: "Banderilla", price: 25.0, category: "🌮 Platos", icon: "🌭", stock: 100),
+        FoodItem(name: "Enfrijoladas", price: 35.0, category: "🌮 Platos", icon: "🥘", stock: 100),
+        FoodItem(name: "Elote Cocido", price: 25.0, category: "🌮 Platos", icon: "🌽", stock: 100),
+        FoodItem(name: "Tlacoyo", price: 25.0, category: "🌮 Platos", icon: "🫓", stock: 100),
+
+        FoodItem(name: "Chilaquiles (Lunes)", price: 40.0, category: "⭐ Especialidad por Día", icon: "🥣", dayOfWeek: 2, stock: 100),
+        FoodItem(name: "Torta de Milanesa (Martes)", price: 35.0, category: "⭐ Especialidad por Día", icon: "🥩", dayOfWeek: 3, stock: 100),
+        FoodItem(name: "Hot cakes (Miércoles)", price: 25.0, category: "⭐ Especialidad por Día", icon: "🥞", dayOfWeek: 4, stock: 100),
+        FoodItem(name: "Taco de Bistec (Jueves)", price: 30.0, category: "⭐ Especialidad por Día", icon: "🌯", dayOfWeek: 5, stock: 100),
+        FoodItem(name: "Pambazo (Viernes)", price: 30.0, category: "⭐ Especialidad por Día", icon: "🍔", dayOfWeek: 6, stock: 100),
+
+        FoodItem(name: "Palomitas", price: 12.0, category: "🍉 Snacks y Fruta", icon: "🍿", stock: 100),
+        FoodItem(name: "Vaso de Jícama", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥕", stock: 100),
+        FoodItem(name: "Vaso de Zanahoria", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥕", stock: 100),
+        FoodItem(name: "Vaso de Pepino", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥒", stock: 100),
+        FoodItem(name: "Vaso de Sandía", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🍉", stock: 100),
+        FoodItem(name: "Vaso de Mango", price: 28.0, category: "🍉 Snacks y Fruta", icon: "🥭", stock: 100),
+        FoodItem(name: "Jicaleta", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🍭", stock: 100),
+        FoodItem(name: "Congelada Horchata", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊", stock: 100),
+        FoodItem(name: "Congelada Tamarindo", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊", stock: 100),
+        FoodItem(name: "Congelada Guayaba", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊", stock: 100),
+        FoodItem(name: "Congelada Limón", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊", stock: 100),
+        FoodItem(name: "Congelada Jamaica", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊", stock: 100),
+
+        FoodItem(name: "Agua Grande", price: 14.0, category: "💧 Bebidas", icon: "💧", stock: 100),
+        FoodItem(name: "Agua Chica", price: 10.0, category: "💧 Bebidas", icon: "🚰", stock: 100)
+    ]
+    
     @Published var loggedEmail: String? = nil
     @Published var isAuthenticating = false
 
@@ -708,6 +827,7 @@ final class AppViewModel: ObservableObject {
 
     func startServerSync() {
         firebase.syncUsersBalances(appVM: self)
+        firebase.listenToInventory(appVM: self)
 
         if let email = loggedEmail, !email.isEmpty {
             firebase.listenOrders(for: email, appVM: self)
@@ -1154,36 +1274,6 @@ struct MenuView: View {
 
     var currentDay: Int { Calendar.current.component(.weekday, from: Date()) }
 
-    let menu = [
-        FoodItem(name: "Mollete", price: 15.0, category: "🌮 Platos", icon: "🥖"),
-        FoodItem(name: "Torta de Salchicha", price: 35.0, category: "🌮 Platos", icon: "🥪"),
-        FoodItem(name: "Sopes", price: 25.0, category: "🌮 Platos", icon: "🥙"),
-        FoodItem(name: "Tacos de Frijol", price: 30.0, category: "🌮 Platos", icon: "🌮"),
-        FoodItem(name: "Salchipulpos", price: 30.0, category: "🌮 Platos", icon: "🐙"),
-        FoodItem(name: "Banderilla", price: 25.0, category: "🌮 Platos", icon: "🌭"),
-        FoodItem(name: "Enfrijoladas", price: 35.0, category: "🌮 Platos", icon: "🥘"),
-        FoodItem(name: "Elote Cocido", price: 25.0, category: "🌮 Platos", icon: "🌽"),
-        FoodItem(name: "Tlacoyo", price: 25.0, category: "🌮 Platos", icon: "🫓"),
-
-        FoodItem(name: "Chilaquiles (Lunes)", price: 40.0, category: "⭐ Especialidad por Día", icon: "🥣", dayOfWeek: 2),
-        FoodItem(name: "Torta de Milanesa (Martes)", price: 35.0, category: "⭐ Especialidad por Día", icon: "🥩", dayOfWeek: 3),
-        FoodItem(name: "Hot cakes (Miércoles)", price: 25.0, category: "⭐ Especialidad por Día", icon: "🥞", dayOfWeek: 4),
-        FoodItem(name: "Taco de Bistec (Jueves)", price: 30.0, category: "⭐ Especialidad por Día", icon: "🌯", dayOfWeek: 5),
-        FoodItem(name: "Pambazo (Viernes)", price: 30.0, category: "⭐ Especialidad por Día", icon: "🍔", dayOfWeek: 6),
-
-        FoodItem(name: "Palomitas", price: 12.0, category: "🍉 Snacks y Fruta", icon: "🍿"),
-        FoodItem(name: "Vaso de Jícama", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥕"),
-        FoodItem(name: "Vaso de Zanahoria", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥕"),
-        FoodItem(name: "Vaso de Pepino", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🥒"),
-        FoodItem(name: "Vaso de Sandía", price: 20.0, category: "🍉 Snacks y Fruta", icon: "🍉"),
-        FoodItem(name: "Vaso de Mango", price: 28.0, category: "🍉 Snacks y Fruta", icon: "🥭"),
-        FoodItem(name: "Jicaleta", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🍭"),
-        FoodItem(name: "Congelada", price: 15.0, category: "🍉 Snacks y Fruta", icon: "🧊"),
-
-        FoodItem(name: "Agua Grande", price: 14.0, category: "💧 Bebidas", icon: "💧"),
-        FoodItem(name: "Agua Chica", price: 10.0, category: "💧 Bebidas", icon: "🚰")
-    ]
-
     var body: some View {
         NavigationStack {
             ZStack(alignment: .bottom) {
@@ -1209,7 +1299,7 @@ struct MenuView: View {
                                                     .font(.headline)
                                                     .foregroundColor(.primary)
 
-                                                Text("\(menu.filter { $0.category == cat }.count) productos")
+                                                Text("\(appVM.menu.filter { $0.category == cat }.count) productos")
                                                     .font(.caption)
                                                     .foregroundColor(.secondary)
                                             }
@@ -1230,9 +1320,11 @@ struct MenuView: View {
 
                                     if expandedCategories.contains(cat) {
                                         VStack(spacing: 12) {
-                                            ForEach(menu.filter { $0.category == cat }) { item in
-                                                let quantity = appVM.cart.filter { $0.name == item.name }.count
-                                                let isAvailable = (cat != "⭐ Especialidad por Día" || item.dayOfWeek == currentDay)
+                                            ForEach(appVM.menu.filter { $0.category == cat }) { item in
+                                                let quantity = appVM.cart.filter { $0.id == item.id }.count
+                                                let isAvailableToday = (cat != "⭐ Especialidad por Día" || item.dayOfWeek == currentDay)
+                                                let hasStock = item.stock > 0
+                                                let isAvailable = isAvailableToday && hasStock
 
                                                 HStack(spacing: 14) {
                                                     ZStack {
@@ -1258,17 +1350,21 @@ struct MenuView: View {
                                                             if quantity > 0 {
                                                                 Text("\(quantity) en carrito")
                                                                     .font(.caption.bold())
-                                                                    .padding(.horizontal, 10)
-                                                                    .padding(.vertical, 5)
+                                                                    .padding(.horizontal, 8)
+                                                                    .padding(.vertical, 4)
                                                                     .background(Color.accentColor.opacity(0.14))
                                                                     .foregroundColor(.accentColor)
                                                                     .clipShape(Capsule())
                                                             }
                                                         }
 
-                                                        if !isAvailable {
+                                                        if isAvailableToday {
+                                                            Text(hasStock ? "Disponibles: \(item.stock)" : "Agotado")
+                                                                .font(.system(size: 10, weight: .bold))
+                                                                .foregroundColor(item.stock > 5 ? .secondary : (hasStock ? .orange : .red))
+                                                        } else {
                                                             Text("No disponible hoy")
-                                                                .font(.caption)
+                                                                .font(.system(size: 10, weight: .bold))
                                                                 .foregroundColor(.red)
                                                         }
                                                     }
@@ -1288,7 +1384,7 @@ struct MenuView: View {
                                                         } else {
                                                             HStack(spacing: 12) {
                                                                 Button {
-                                                                    if let index = appVM.cart.lastIndex(where: { $0.name == item.name }) {
+                                                                    if let index = appVM.cart.lastIndex(where: { $0.id == item.id }) {
                                                                         appVM.cart.remove(at: index)
                                                                     }
                                                                 } label: {
@@ -1303,46 +1399,41 @@ struct MenuView: View {
                                                                     .frame(minWidth: 20)
 
                                                                 Button {
-                                                                    appVM.cart.append(item)
+                                                                    if quantity < item.stock {
+                                                                        appVM.cart.append(item)
+                                                                    }
                                                                 } label: {
                                                                     Image(systemName: "plus.circle.fill")
                                                                         .font(.system(size: 28))
-                                                                        .foregroundColor(.green)
+                                                                        .foregroundColor(quantity < item.stock ? .green : .gray.opacity(0.4))
                                                                 }
                                                                 .buttonStyle(.borderless)
+                                                                .disabled(quantity >= item.stock)
                                                             }
                                                             .padding(.horizontal, 12)
                                                             .padding(.vertical, 8)
                                                             .background(Color.white)
                                                             .clipShape(Capsule())
-                                                            .overlay(
-                                                                Capsule()
-                                                                    .stroke(Color.gray.opacity(0.22), lineWidth: 1)
-                                                            )
+                                                            .overlay(Capsule().stroke(Color.gray.opacity(0.22), lineWidth: 1))
                                                         }
                                                     }
                                                 }
-                                                .padding(14)
-                                                .background(
-                                                    RoundedRectangle(cornerRadius: 20)
-                                                        .fill(Color(UIColor.systemBackground))
-                                                )
                                             }
                                         }
-                                        .padding(.top, 12)
                                     }
                                 }
-                                .padding()
-                                .background(
-                                    RoundedRectangle(cornerRadius: 24)
-                                        .fill(Color(UIColor.secondarySystemGroupedBackground))
-                                )
+                                .padding(.top, 12)
                             }
-
-                            Color.clear.frame(height: appVM.cart.isEmpty ? 12 : 100)
                         }
                         .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 24)
+                                .fill(Color(UIColor.secondarySystemGroupedBackground))
+                        )
+
+                        Color.clear.frame(height: appVM.cart.isEmpty ? 12 : 100)
                     }
+                    .padding()
                 }
 
                 if !appVM.cart.isEmpty {
@@ -1514,30 +1605,25 @@ struct CheckoutView: View {
                     }
                 }
 
-                Section("Pedido") {
+                // 👉 AQUÍ ESTÁ EL NUEVO SLIDER REEMPLAZANDO EL BOTÓN ANTERIOR
+                Section {
                     if !paymentError.isEmpty {
                         Text(paymentError)
                             .foregroundColor(.red)
                             .font(.caption)
+                            .padding(.bottom, 5)
                     }
 
-                    Button {
+                    SwipeToConfirmButton(
+                        isProcessing: isProcessing,
+                        isDisabled: appVM.users.isEmpty || appVM.cart.isEmpty || !puedeConfirmarPedido
+                    ) {
                         confirmOrder()
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if isProcessing {
-                                ProgressView()
-                            } else {
-                                Text("Confirmar Pedido")
-                                    .bold()
-                            }
-                            Spacer()
-                        }
                     }
-                    .disabled(isProcessing || appVM.users.isEmpty || appVM.cart.isEmpty || !puedeConfirmarPedido)
-                    .foregroundColor(.accentColor)
+                    .padding(.vertical, 8)
                 }
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
             }
         }
         .onAppear {
@@ -1625,6 +1711,8 @@ struct CheckoutView: View {
 
                             switch balanceResult {
                             case .success:
+                                appVM.firebase.deductInventory(cart: itemsSnapshot)
+
                                 let order = PastOrder(
                                     orderID: orderID,
                                     date: Date(),
@@ -1998,14 +2086,88 @@ struct AccountView: View {
                             }
                         }
                     }
-                    .padding()
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 22))
                 }
                 .padding()
             }
             .background(Color(UIColor.systemGroupedBackground).ignoresSafeArea())
             .navigationTitle("Cuenta")
+        }
+    }
+}
+
+// MARK: - COMPONENTES PERSONALIZADOS
+struct SwipeToConfirmButton: View {
+    var isProcessing: Bool
+    var isDisabled: Bool
+    var action: () -> Void
+
+    @State private var offset: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { geometry in
+            let maxTranslation = geometry.size.width - 56
+            
+            ZStack(alignment: .leading) {
+                // Fondo de la barra
+                Capsule()
+                    .fill(isDisabled ? Color.gray.opacity(0.2) : Color.accentColor.opacity(0.15))
+
+                // Texto centrado que se desvanece al deslizar
+                Text(isProcessing ? "Procesando..." : "Desliza para confirmar")
+                    .font(.headline.bold())
+                    .foregroundColor(isDisabled ? .gray : .accentColor)
+                    .frame(maxWidth: .infinity)
+                    .opacity(isProcessing ? 1 : 1 - Double(offset / maxTranslation))
+
+                // Relleno de color que sigue al dedo
+                Capsule()
+                    .fill(isDisabled ? Color.gray : Color.accentColor)
+                    .frame(width: offset + 56)
+
+                // El botón circular (Thumb)
+                Circle()
+                    .fill(Color.white)
+                    .padding(4)
+                    .frame(width: 56, height: 56)
+                    .shadow(color: .black.opacity(0.15), radius: 4, x: 0, y: 2)
+                    .overlay(
+                        Image(systemName: isProcessing ? "hourglass" : "chevron.right.2")
+                            .font(.title3.bold())
+                            .foregroundColor(isDisabled ? .gray.opacity(0.5) : .accentColor)
+                    )
+                    .offset(x: offset)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                guard !isDisabled, !isProcessing else { return }
+                                let translation = value.translation.width
+                                offset = min(max(translation, 0), maxTranslation)
+                            }
+                            .onEnded { value in
+                                guard !isDisabled, !isProcessing else { return }
+                                if offset > maxTranslation * 0.75 { // Requiere llegar al 75% para activarse
+                                    withAnimation(.easeOut(duration: 0.2)) {
+                                        offset = maxTranslation
+                                    }
+                                    action()
+                                } else {
+                                    // Si no llega, se regresa como liga
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                        offset = 0
+                                    }
+                                }
+                            }
+                    )
+            }
+        }
+        .frame(height: 56)
+        .onChange(of: isProcessing) { _, processing in
+            // Si termina de procesar, la bolita regresa sola al inicio
+            if !processing {
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                    offset = 0
+                }
+            }
         }
     }
 }
