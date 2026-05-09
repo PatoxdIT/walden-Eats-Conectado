@@ -202,6 +202,8 @@ func minutosDelDia(_ date: Date = Date()) -> Int {
 }
 
 func sePuedePedir(recess: String, en date: Date = Date()) -> Bool {
+    if UserDefaults.standard.bool(forKey: "WaldenModoPruebasHorario") { return true }
+    
     let nowMinutes = minutosDelDia(date)
     let inicio = 5 * 60 // 5:00 AM
 
@@ -220,10 +222,17 @@ func sePuedePedir(recess: String, en date: Date = Date()) -> Bool {
 }
 
 func recesosDisponiblesHoy(en date: Date = Date()) -> [String] {
-    ["1er Receso", "2do Receso"].filter { sePuedePedir(recess: $0, en: date) }
+    if UserDefaults.standard.bool(forKey: "WaldenModoPruebasHorario") {
+        return ["1er Receso", "2do Receso"]
+    }
+    return ["1er Receso", "2do Receso"].filter { sePuedePedir(recess: $0, en: date) }
 }
 
 func mensajeHorarioPedidos(en date: Date = Date()) -> String {
+    if UserDefaults.standard.bool(forKey: "WaldenModoPruebasHorario") {
+        return "🛠️ MODO PRUEBAS: Horario desactivado. Puedes pedir a cualquier hora."
+    }
+    
     if sePuedePedir(recess: "1er Receso", en: date) && sePuedePedir(recess: "2do Receso", en: date) {
         return "Puedes pedir para 1er y 2do receso."
     } else if sePuedePedir(recess: "1er Receso", en: date) {
@@ -532,7 +541,7 @@ final class FirebaseWalletService: ObservableObject {
         }
     }
 
-    // MARK: INVENTORY SYNC (VERSIÓN RAYOS X)
+    // MARK: INVENTORY SYNC
     func listenToInventory(appVM: AppViewModel) {
         inventoryListener?.remove()
         
@@ -554,10 +563,8 @@ final class FirebaseWalletService: ObservableObject {
                     let itemName = doc.documentID.trimmingCharacters(in: .whitespacesAndNewlines)
                     let data = doc.data()
                     
-                    // 🚨 ESTO NOS DIRÁ LA VERDAD ABSOLUTA
                     print("📦 Firebase tiene el platillo: '\(itemName)' con estos datos: \(data)")
                     
-                    // Intentamos leer el stock con varios nombres comunes por si Gourmet lo guarda diferente
                     let rawStock = data["stock"] ?? data["Stock"] ?? data["cantidad"] ?? data["Cantidad"]
                     var stockRecibido = 0
                     
@@ -1422,7 +1429,6 @@ struct MenuView: View {
                                         }
                                     }
                                 }
-                                .padding(.top, 12)
                             }
                         }
                         .padding()
@@ -1605,7 +1611,6 @@ struct CheckoutView: View {
                     }
                 }
 
-                // 👉 AQUÍ ESTÁ EL NUEVO SLIDER REEMPLAZANDO EL BOTÓN ANTERIOR
                 Section {
                     if !paymentError.isEmpty {
                         Text(paymentError)
@@ -1964,6 +1969,17 @@ struct SettingsView: View {
                         nIdentifierCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
                 }
+                
+                Section {
+                    NavigationLink(destination: DeveloperView()) {
+                        HStack {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundColor(.blue)
+                            Text("Créditos de la App")
+                                .font(.headline)
+                        }
+                    }
+                }
             }
             .navigationTitle("Ajustes")
         }
@@ -1990,6 +2006,44 @@ struct SettingsView: View {
                 passwordError = error.localizedDescription
             }
         }
+    }
+}
+
+// MARK: - CRÉDITOS
+struct DeveloperView: View {
+    var body: some View {
+        Form {
+            Section(header: Text("Créditos de la App")) {
+                DisclosureGroup("Desarrolladores") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Ubaldo Orozco Camargo")
+                        Text("Patricio Aguilar Pacheco")
+                    }
+                    .padding(.vertical, 4)
+                }
+                
+                DisclosureGroup("Editores") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Hansel Eduardo Ortega Borges")
+                        Text("Santiago Aragoneses Arismendi")
+                        Text("Eduardo García Parra")
+                        Text("Ian Enoc Medina Ruiz")
+                    }
+                    .padding(.vertical, 4)
+                }
+                
+                DisclosureGroup("Actrices") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Daniela Fuentes Cabrera")
+                        Text("Diana Diaz Jimenez")
+                        Text("Sofia Rock Marquez")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .navigationTitle("Créditos")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
